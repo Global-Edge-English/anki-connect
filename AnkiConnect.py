@@ -61,8 +61,13 @@ else:
     from urllib import request
     web = request
 
-    from PyQt5.QtCore import QTimer
-    from PyQt5.QtWidgets import QMessageBox
+    # Try PyQt6 first (for newer Anki versions), then fall back to PyQt5
+    try:
+        from PyQt6.QtCore import QTimer
+        from PyQt6.QtWidgets import QMessageBox
+    except ImportError:
+        from PyQt5.QtCore import QTimer
+        from PyQt5.QtWidgets import QMessageBox
 
 
 #
