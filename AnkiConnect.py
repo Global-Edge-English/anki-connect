@@ -30,6 +30,12 @@ import sys
 from time import time
 from unicodedata import normalize
 from operator import itemgetter
+try:
+    from .profile_manager import ProfileManager
+except ImportError:
+    # Fallback for older Python versions or different import contexts
+    import profile_manager
+    ProfileManager = profile_manager.ProfileManager
 
 
 #
@@ -349,6 +355,10 @@ class AnkiNoteParams:
 #
 
 class AnkiBridge:
+    def __init__(self):
+        # Initialize profile manager
+        self.profile_manager = ProfileManager(self)
+    
     def storeMediaFile(self, filename, data):
         self.deleteMediaFile(filename)
         self.media().writeData(filename, base64.b64decode(data))
@@ -952,6 +962,24 @@ class AnkiBridge:
         timer.timeout.connect(exitAnki)
         timer.start(1000) # 1s should be enough to allow the response to be sent.
 
+
+    # Profile management methods - delegate to ProfileManager
+    def getCurrentProfile(self):
+        """Get current profile information"""
+        return self.profile_manager.getCurrentProfile()
+
+    def getProfiles(self):
+        """Get list of available profiles"""
+        return self.profile_manager.getProfiles()
+
+    def switchProfile(self, profileName):
+        """Switch to a different profile"""
+        return self.profile_manager.switchProfile(profileName)
+
+    def createProfile(self, profileName):
+        """Create a new profile"""
+        return self.profile_manager.createProfile(profileName)
+
 #
 # AnkiConnect
 #
@@ -1285,6 +1313,22 @@ class AnkiConnect:
     @webApi()
     def notesInfo(self, notes):
         return self.anki.notesInfo(notes)
+
+    @webApi()
+    def getCurrentProfile(self):
+        return self.anki.getCurrentProfile()
+
+    @webApi()
+    def getProfiles(self):
+        return self.anki.getProfiles()
+
+    @webApi()
+    def switchProfile(self, profileName):
+        return self.anki.switchProfile(profileName)
+
+    @webApi()
+    def createProfile(self, profileName):
+        return self.anki.createProfile(profileName)
 
 #
 #   Entry
