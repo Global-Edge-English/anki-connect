@@ -45,6 +45,20 @@ except ImportError:
     import study_manager
     StudyManager = study_manager.StudyManager
 
+try:
+    from .audio_generator import AudioGenerator
+except ImportError:
+    # Fallback for older Python versions or different import contexts
+    import audio_generator
+    AudioGenerator = audio_generator.AudioGenerator
+
+try:
+    from .settings_dialog import show_settings_dialog
+except ImportError:
+    # Fallback for older Python versions or different import contexts
+    import settings_dialog
+    show_settings_dialog = settings_dialog.show_settings_dialog
+
 
 #
 # Constants
@@ -455,8 +469,9 @@ class AnkiBridge:
             if name in note:
                 note[name] = value
 
-        if not note.dupeOrEmpty():
-            return note
+        # Check for duplicates - Anki checks the first field by default
+        # Return the note even if it's a duplicate - let the caller decide
+        return note
 
     def updateNoteFields(self, params):
         collection = self.collection()
@@ -981,40 +996,103 @@ class AnkiBridge:
         timer.timeout.connect(exitAnki)
         timer.start(1000) # 1s should be enough to allow the response to be sent.
 
-    def invalidateCaches(self):
-        """Invalidate all Anki caches to force reload from database"""
+    def addAudioNote(self, params, language="en", allowDuplicate=True):
+        """
+        Add a note with TTS audio generation
+        
+        Args:
+            params: Note parameters (deckName, modelName, fields, tags)
+            language: Language code for TTS (e.g., "en", "es", "fr")
+            allowDuplicate: Allow duplicate first field (default: True)
+        
+        Returns:
+            Note ID on success
+        """
         try:
             collection = self.collection()
-            window = self.window()
-            if collection and window:
-                # Force complete reload - this is the nuclear option
-                # Clear all in-memory data structures
-                collection.models.models.clear()
-                collection.decks.decks.clear()
-                collection.decks.dconf.clear()
-                
-                # Force reload from database
-                collection.load()
-                
-                # Reset interface completely
-                window.reset()
-                    
-                return True
-            return False
-        except Exception as e:
-            # If aggressive reload fails, try gentler approach
+            if collection is None:
+                raise Exception("Anki collection not available - is Anki running?")
+            
+            # Validate Audio field exists and has content
+            if 'Audio' not in params.get('fields', {}):
+                raise Exception("Audio field is required for addAudioNote. Your note model must have an 'Audio' field.")
+            
+            audio_text = params['fields']['Audio']
+            if not audio_text or not audio_text.strip():
+                raise Exception("Audio field cannot be empty - please provide text to convert to speech")
+            
+            # Validate model exists
+            model_name = params.get('modelName')
+            model = collection.models.byName(model_name)
+            if model is None:
+                available_models = collection.models.allNames()
+                raise Exception(f"Model '{model_name}' not found. Available models: {', '.join(available_models)}")
+            
+            # Check if model has Audio1 field
+            model_fields = [field['name'] for field in model['flds']]
+            if 'Audio1' not in model_fields:
+                raise Exception(f"Model '{model_name}' must have an 'Audio1' field. Current fields: {', '.join(model_fields)}")
+            
+            # Validate deck exists
+            deck_name = params.get('deckName')
+            deck = collection.decks.byName(deck_name)
+            if deck is None:
+                available_decks = collection.decks.allNames()
+                raise Exception(f"Deck '{deck_name}' not found. Available decks: {', '.join(available_decks[:10])}...")
+            
+            # Generate audio using ElevenLabs (voice selected randomly)
+            audio_gen = AudioGenerator()
             try:
-                collection = self.collection()
-                window = self.window()
-                if collection and window:
-                    collection.models.flush()
-                    collection.decks.flush()
-                    window.requireReset()
-                    window.maybeReset()
-                    return True
-                return False
-            except:
-                return False
+                audio_data, filename = audio_gen.generate_audio(audio_text, language)
+            except Exception as e:
+                raise Exception(f"Audio generation failed: {str(e)}")
+            
+            # Store audio file in media folder
+            try:
+                self.media().writeData(filename, audio_data)
+            except Exception as e:
+                raise Exception(f"Failed to write audio file to media folder: {str(e)}")
+            
+            # Add audio reference to Audio1 field
+            if 'Audio1' not in params['fields']:
+                params['fields']['Audio1'] = ''
+            params['fields']['Audio1'] += u'[sound:{}]'.format(filename)
+            
+            # Create the note - allow duplicates for audio notes by default
+            note_params = AnkiNoteParams(params)
+            if not note_params.validate():
+                raise Exception(f"Note parameters validation failed. Check deckName, modelName, fields, and tags are all valid strings.")
+            
+            # Create note object
+            model = collection.models.byName(model_name)
+            note = anki.notes.Note(collection, model)
+            note.tags = params.get('tags', [])
+            
+            for name, value in params['fields'].items():
+                if name in note:
+                    note[name] = value
+            
+            # For addAudioNote, always allow duplicates by default
+            # since users often want multiple audio variations of the same word
+            if not allowDuplicate and note.dupeOrEmpty():
+                raise Exception(f"Duplicate note detected. First field '{list(params['fields'].keys())[0]}' already exists with value '{list(params['fields'].values())[0]}'")
+            
+            self.startEditing()
+            collection.addNote(note)
+            
+            # Move the cards to the correct deck after note creation
+            cardIds = [card.id for card in note.cards()]
+            if cardIds and deck['id'] != collection.decks.get_current_id():
+                self.changeDeck(cardIds, deck_name)
+            
+            collection.autosave()
+            self.stopEditing()
+            
+            return note.id
+            
+        except Exception as e:
+            # Re-raise with context
+            raise Exception(f"addAudioNote error: {str(e)}")
 
 
 
@@ -1034,8 +1112,8 @@ class AnkiConnect:
             self.timer.timeout.connect(self.advance)
             self.timer.start(TICK_INTERVAL)
             
-            # Add menu item for cache invalidation
-            self.addCacheInvalidationMenu()
+            # Add menu item for settings
+            self.addSettingsMenu()
         except:
             QMessageBox.critical(
                 self.anki.window(),
@@ -1043,35 +1121,22 @@ class AnkiConnect:
                 'Failed to listen on port {}.\nMake sure it is available and is not in use.'.format(NET_PORT)
             )
 
-    def addCacheInvalidationMenu(self):
-        """Add menu item to Tools menu for cache invalidation"""
+    def addSettingsMenu(self):
+        """Add menu item to Tools menu for AnkiConnect settings"""
         try:
             from aqt import mw
             from aqt.qt import QAction
             
-            action = QAction("Refresh AnkiConnect Caches", mw)
-            action.setShortcut("Ctrl+Shift+R")
-            action.triggered.connect(self.onCacheInvalidationClicked)
+            action = QAction("AnkiConnect Settings", mw)
+            action.triggered.connect(self.onSettingsClicked)
             mw.form.menuTools.addSeparator()
             mw.form.menuTools.addAction(action)
         except:
             pass  # Ignore if menu setup fails
 
-    def onCacheInvalidationClicked(self):
-        """Handle menu item click for cache invalidation"""
-        success = self.anki.invalidateCaches()
-        if success:
-            QMessageBox.information(
-                self.anki.window(),
-                'AnkiConnect',
-                'Caches refreshed successfully! Interface should now reflect any database changes.'
-            )
-        else:
-            QMessageBox.warning(
-                self.anki.window(),
-                'AnkiConnect', 
-                'Failed to refresh caches.'
-            )
+    def onSettingsClicked(self):
+        """Handle menu item click for settings"""
+        show_settings_dialog(self.anki.window())
 
 
     def advance(self):
@@ -1383,9 +1448,19 @@ class AnkiConnect:
         return self.anki.guiExitAnki()
 
     @webApi()
-    def invalidateCaches(self):
-        """Invalidate all Anki caches to force reload from database"""
-        return self.anki.invalidateCaches()
+    def addAudioNote(self, note, language="en", allowDuplicate=True):
+        """
+        Add a note with TTS audio generation
+        
+        Args:
+            note: Note parameters (deckName, modelName, fields, tags)
+            language: Language code for TTS (default: "en")
+            allowDuplicate: Allow duplicate notes (default: True)
+        
+        Returns:
+            Note ID on success
+        """
+        return self.anki.addAudioNote(note, language, allowDuplicate)
 
     @webApi()
     def cardsInfo(self, cards):
