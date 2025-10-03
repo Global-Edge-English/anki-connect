@@ -30,12 +30,20 @@ import sys
 from time import time
 from unicodedata import normalize
 from operator import itemgetter
+
 try:
-    from .profile_manager import ProfileManager
+    from .note_manager import NoteManager
 except ImportError:
     # Fallback for older Python versions or different import contexts
-    import profile_manager
-    ProfileManager = profile_manager.ProfileManager
+    import note_manager
+    NoteManager = note_manager.NoteManager
+
+try:
+    from .study_manager import StudyManager
+except ImportError:
+    # Fallback for older Python versions or different import contexts
+    import study_manager
+    StudyManager = study_manager.StudyManager
 
 
 #
@@ -356,8 +364,7 @@ class AnkiNoteParams:
 
 class AnkiBridge:
     def __init__(self):
-        # Initialize profile manager
-        self.profile_manager = ProfileManager(self)
+        pass
     
     def storeMediaFile(self, filename, data):
         self.deleteMediaFile(filename)
@@ -391,6 +398,11 @@ class AnkiBridge:
         if note is None:
             return
 
+        # Get the target deck
+        deck = collection.decks.byName(params.deckName)
+        if deck is None:
+            return
+
         if params.audio is not None and len(params.audio.fields) > 0:
             data = download(params.audio.url)
             if data is not None:
@@ -407,6 +419,12 @@ class AnkiBridge:
 
         self.startEditing()
         collection.addNote(note)
+        
+        # Move the cards to the correct deck after note creation
+        cardIds = [card.id for card in note.cards()]
+        if cardIds and deck['id'] != collection.decks.get_current_id():
+            self.changeDeck(cardIds, params.deckName)
+        
         collection.autosave()
         self.stopEditing()
 
@@ -431,7 +449,6 @@ class AnkiBridge:
             return
 
         note = anki.notes.Note(collection, model)
-        note.model()['did'] = deck['id']
         note.tags = params.tags
 
         for name, value in params.fields.items():
@@ -632,6 +649,8 @@ class AnkiBridge:
                 templates[template['name']] = fields
 
             return templates
+
+
 
 
     def getDeckConfig(self, deck):
@@ -962,23 +981,42 @@ class AnkiBridge:
         timer.timeout.connect(exitAnki)
         timer.start(1000) # 1s should be enough to allow the response to be sent.
 
+    def invalidateCaches(self):
+        """Invalidate all Anki caches to force reload from database"""
+        try:
+            collection = self.collection()
+            window = self.window()
+            if collection and window:
+                # Force complete reload - this is the nuclear option
+                # Clear all in-memory data structures
+                collection.models.models.clear()
+                collection.decks.decks.clear()
+                collection.decks.dconf.clear()
+                
+                # Force reload from database
+                collection.load()
+                
+                # Reset interface completely
+                window.reset()
+                    
+                return True
+            return False
+        except Exception as e:
+            # If aggressive reload fails, try gentler approach
+            try:
+                collection = self.collection()
+                window = self.window()
+                if collection and window:
+                    collection.models.flush()
+                    collection.decks.flush()
+                    window.requireReset()
+                    window.maybeReset()
+                    return True
+                return False
+            except:
+                return False
 
-    # Profile management methods - delegate to ProfileManager
-    def getCurrentProfile(self):
-        """Get current profile information"""
-        return self.profile_manager.getCurrentProfile()
 
-    def getProfiles(self):
-        """Get list of available profiles"""
-        return self.profile_manager.getProfiles()
-
-    def switchProfile(self, profileName):
-        """Switch to a different profile"""
-        return self.profile_manager.switchProfile(profileName)
-
-    def createProfile(self, profileName):
-        """Create a new profile"""
-        return self.profile_manager.createProfile(profileName)
 
 #
 # AnkiConnect
@@ -995,11 +1033,44 @@ class AnkiConnect:
             self.timer = QTimer()
             self.timer.timeout.connect(self.advance)
             self.timer.start(TICK_INTERVAL)
+            
+            # Add menu item for cache invalidation
+            self.addCacheInvalidationMenu()
         except:
             QMessageBox.critical(
                 self.anki.window(),
                 'AnkiConnect',
                 'Failed to listen on port {}.\nMake sure it is available and is not in use.'.format(NET_PORT)
+            )
+
+    def addCacheInvalidationMenu(self):
+        """Add menu item to Tools menu for cache invalidation"""
+        try:
+            from aqt import mw
+            from aqt.qt import QAction
+            
+            action = QAction("Refresh AnkiConnect Caches", mw)
+            action.setShortcut("Ctrl+Shift+R")
+            action.triggered.connect(self.onCacheInvalidationClicked)
+            mw.form.menuTools.addSeparator()
+            mw.form.menuTools.addAction(action)
+        except:
+            pass  # Ignore if menu setup fails
+
+    def onCacheInvalidationClicked(self):
+        """Handle menu item click for cache invalidation"""
+        success = self.anki.invalidateCaches()
+        if success:
+            QMessageBox.information(
+                self.anki.window(),
+                'AnkiConnect',
+                'Caches refreshed successfully! Interface should now reflect any database changes.'
+            )
+        else:
+            QMessageBox.warning(
+                self.anki.window(),
+                'AnkiConnect', 
+                'Failed to refresh caches.'
             )
 
 
@@ -1124,8 +1195,13 @@ class AnkiConnect:
     @webApi()
     def addNote(self, note):
         params = AnkiNoteParams(note)
-        if params.validate():
-            return self.anki.addNote(params)
+        if not params.validate():
+            raise Exception("Note parameters validation failed")
+        
+        result = self.anki.addNote(params)
+        if result is None:
+            raise Exception("Failed to create note - no note ID returned")
+        return result
 
 
     @webApi()
@@ -1307,6 +1383,11 @@ class AnkiConnect:
         return self.anki.guiExitAnki()
 
     @webApi()
+    def invalidateCaches(self):
+        """Invalidate all Anki caches to force reload from database"""
+        return self.anki.invalidateCaches()
+
+    @webApi()
     def cardsInfo(self, cards):
         return self.anki.cardsInfo(cards)
 
@@ -1314,21 +1395,67 @@ class AnkiConnect:
     def notesInfo(self, notes):
         return self.anki.notesInfo(notes)
 
+    # Note/Model Management - Simple current profile usage
     @webApi()
-    def getCurrentProfile(self):
-        return self.anki.getCurrentProfile()
+    def createModel(self, modelName, fields, templates, css=""):
+        return NoteManager(self.anki).createModel(modelName, fields, templates, css)
 
     @webApi()
-    def getProfiles(self):
-        return self.anki.getProfiles()
+    def updateModel(self, modelId, modelName=None, fields=None, templates=None, css=None):
+        return NoteManager(self.anki).updateModel(modelId, modelName, fields, templates, css)
 
     @webApi()
-    def switchProfile(self, profileName):
-        return self.anki.switchProfile(profileName)
+    def deleteModel(self, modelId):
+        return NoteManager(self.anki).deleteModel(modelId)
 
     @webApi()
-    def createProfile(self, profileName):
-        return self.anki.createProfile(profileName)
+    def createDeck(self, deckName):
+        return NoteManager(self.anki).createDeck(deckName)
+
+    @webApi()
+    def getModelInfo(self, modelId):
+        return NoteManager(self.anki).getModelInfo(modelId)
+
+    @webApi()
+    def getDeckInfo(self, deckName):
+        return NoteManager(self.anki).getDeckInfo(deckName)
+
+    @webApi()
+    def deleteDeck(self, deckName, deleteCards=False):
+        return NoteManager(self.anki).deleteDeck(deckName, deleteCards)
+
+    @webApi()
+    def renameDeck(self, oldName, newName):
+        return NoteManager(self.anki).renameDeck(oldName, newName)
+
+    # Study Management - Direct usage  
+    @webApi()
+    def getNextReviewCard(self, deckName=None):
+        return StudyManager(self.anki).getNextReviewCard(deckName)
+
+    @webApi()
+    def answerCard(self, cardId, ease):
+        return StudyManager(self.anki).answerCard(cardId, ease)
+
+    @webApi()
+    def resetCard(self, cardId):
+        return StudyManager(self.anki).resetCard(cardId)
+
+    @webApi()
+    def forgetCard(self, cardId):
+        return StudyManager(self.anki).forgetCard(cardId)
+
+    @webApi()
+    def getDueCards(self, deckName=None, limit=10):
+        return StudyManager(self.anki).getDueCards(deckName, limit)
+
+    @webApi()
+    def getNewCards(self, deckName=None, limit=10):
+        return StudyManager(self.anki).getNewCards(deckName, limit)
+
+    @webApi()
+    def getStudyStats(self, deckName=None):
+        return StudyManager(self.anki).getStudyStats(deckName)
 
 #
 #   Entry
