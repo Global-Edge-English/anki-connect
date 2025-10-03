@@ -61,12 +61,27 @@ class StudyManager:
             name = info['name']
             fields[name] = {'value': note.fields[order], 'order': order}
         
+        # Get question and answer with version compatibility
+        try:
+            # Try new Anki 2.1.50+ API
+            question = card.question()
+            answer = card.answer()
+        except (AttributeError, TypeError):
+            # Fall back to older API
+            try:
+                qa = card._getQA()
+                question = qa['q']
+                answer = qa['a']
+            except:
+                question = ""
+                answer = ""
+        
         return {
             'cardId': card.id,
             'fields': fields,
             'fieldOrder': card.ord,
-            'question': card._getQA()['q'],
-            'answer': card._getQA()['a'],
+            'question': question,
+            'answer': answer,
             'modelName': model['name'],
             'deckName': self.bridge.deckNameFromId(card.did),
             'css': model['css'],
@@ -104,6 +119,11 @@ class StudyManager:
                 raise Exception(f"Invalid ease value '{ease}'. Must be between 1-4")
             
             self.startEditing()
+            
+            # Start the timer on the card before answering
+            # This is required because answerCard expects timing information
+            # that is normally set when the card is retrieved via getCard()
+            card.startTimer()
             
             # Answer the card
             collection.sched.answerCard(card, ease)

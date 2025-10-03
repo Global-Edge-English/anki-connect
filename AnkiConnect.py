@@ -773,13 +773,28 @@ class AnkiBridge:
                     order = info['ord']
                     name = info['name']
                     fields[name] = {'value': note.fields[order], 'order': order}
+                
+                # Get question and answer with version compatibility
+                try:
+                    # Try new Anki 2.1.50+ API
+                    question = card.question()
+                    answer = card.answer()
+                except (AttributeError, TypeError):
+                    # Fall back to older API
+                    try:
+                        qa = card._getQA()
+                        question = qa['q']
+                        answer = qa['a']
+                    except:
+                        question = ""
+                        answer = ""
             
                 result.append({
                     'cardId': card.id,
                     'fields': fields,
                     'fieldOrder': card.ord,
-                    'question': card._getQA()['q'],
-                    'answer': card._getQA()['a'],
+                    'question': question,
+                    'answer': answer,
                     'modelName': model['name'],
                     'deckName': self.deckNameFromId(card.did),
                     'css': model['css'],
@@ -909,13 +924,28 @@ class AnkiBridge:
             name = info['name']
             fields[name] = {'value': note.fields[order], 'order': order}
 
+        # Get question and answer with version compatibility
+        try:
+            # Try new Anki 2.1.50+ API
+            question = card.question()
+            answer = card.answer()
+        except (AttributeError, TypeError):
+            # Fall back to older API
+            try:
+                qa = card._getQA()
+                question = qa['q']
+                answer = qa['a']
+            except:
+                question = ""
+                answer = ""
+
         if card is not None:
             return {
                 'cardId': card.id,
                 'fields': fields,
                 'fieldOrder': card.ord,
-                'question': card._getQA()['q'],
-                'answer': card._getQA()['a'],
+                'question': question,
+                'answer': answer,
                 'buttons': [b[0] for b in reviewer._answerButtonList()],
                 'modelName': model['name'],
                 'deckName': self.deckNameFromId(card.did),
