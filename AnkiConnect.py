@@ -31,6 +31,34 @@ from time import time
 from unicodedata import normalize
 from operator import itemgetter
 
+try:
+    from .note_manager import NoteManager
+except ImportError:
+    # Fallback for older Python versions or different import contexts
+    import note_manager
+    NoteManager = note_manager.NoteManager
+
+try:
+    from .study_manager import StudyManager
+except ImportError:
+    # Fallback for older Python versions or different import contexts
+    import study_manager
+    StudyManager = study_manager.StudyManager
+
+try:
+    from .audio_generator import AudioGenerator
+except ImportError:
+    # Fallback for older Python versions or different import contexts
+    import audio_generator
+    AudioGenerator = audio_generator.AudioGenerator
+
+try:
+    from .settings_dialog import show_settings_dialog
+except ImportError:
+    # Fallback for older Python versions or different import contexts
+    import settings_dialog
+    show_settings_dialog = settings_dialog.show_settings_dialog
+
 
 #
 # Constants
@@ -61,8 +89,13 @@ else:
     from urllib import request
     web = request
 
-    from PyQt5.QtCore import QTimer
-    from PyQt5.QtWidgets import QMessageBox
+    # Try PyQt6 first (for newer Anki versions), then fall back to PyQt5
+    try:
+        from PyQt6.QtCore import QTimer
+        from PyQt6.QtWidgets import QMessageBox
+    except ImportError:
+        from PyQt5.QtCore import QTimer
+        from PyQt5.QtWidgets import QMessageBox
 
 
 #
@@ -344,6 +377,9 @@ class AnkiNoteParams:
 #
 
 class AnkiBridge:
+    def __init__(self):
+        pass
+    
     def storeMediaFile(self, filename, data):
         self.deleteMediaFile(filename)
         self.media().writeData(filename, base64.b64decode(data))
@@ -376,6 +412,11 @@ class AnkiBridge:
         if note is None:
             return
 
+        # Get the target deck
+        deck = collection.decks.byName(params.deckName)
+        if deck is None:
+            return
+
         if params.audio is not None and len(params.audio.fields) > 0:
             data = download(params.audio.url)
             if data is not None:
@@ -392,6 +433,12 @@ class AnkiBridge:
 
         self.startEditing()
         collection.addNote(note)
+        
+        # Move the cards to the correct deck after note creation
+        cardIds = [card.id for card in note.cards()]
+        if cardIds and deck['id'] != collection.decks.get_current_id():
+            self.changeDeck(cardIds, params.deckName)
+        
         collection.autosave()
         self.stopEditing()
 
@@ -416,15 +463,15 @@ class AnkiBridge:
             return
 
         note = anki.notes.Note(collection, model)
-        note.model()['did'] = deck['id']
         note.tags = params.tags
 
         for name, value in params.fields.items():
             if name in note:
                 note[name] = value
 
-        if not note.dupeOrEmpty():
-            return note
+        # Check for duplicates - Anki checks the first field by default
+        # Return the note even if it's a duplicate - let the caller decide
+        return note
 
     def updateNoteFields(self, params):
         collection = self.collection()
@@ -478,6 +525,65 @@ class AnkiBridge:
             else:
                 suspended.append(False)
         return suspended
+
+
+    def flagCard(self, cardId):
+        """Flag a card with red flag (flag value 1)"""
+        collection = self.collection()
+        if collection is None:
+            return False
+        
+        try:
+            card = collection.getCard(cardId)
+            if card is None:
+                raise Exception(f"Card with ID '{cardId}' does not exist")
+            
+            self.startEditing()
+            card.flags = 1  # Red flag
+            card.flush()
+            collection.autosave()
+            self.stopEditing()
+            return True
+        except Exception as e:
+            self.stopEditing()
+            raise e
+
+
+    def unflagCard(self, cardId):
+        """Remove flag from a card (set flag value to 0)"""
+        collection = self.collection()
+        if collection is None:
+            return False
+        
+        try:
+            card = collection.getCard(cardId)
+            if card is None:
+                raise Exception(f"Card with ID '{cardId}' does not exist")
+            
+            self.startEditing()
+            card.flags = 0  # No flag
+            card.flush()
+            collection.autosave()
+            self.stopEditing()
+            return True
+        except Exception as e:
+            self.stopEditing()
+            raise e
+
+
+    def isCardFlagged(self, cardId):
+        """Check if a card is flagged"""
+        collection = self.collection()
+        if collection is None:
+            return False
+        
+        try:
+            card = collection.getCard(cardId)
+            if card is None:
+                raise Exception(f"Card with ID '{cardId}' does not exist")
+            return card.flags > 0
+        except Exception as e:
+            raise e
 
 
     def areDue(self, cards):
@@ -619,6 +725,8 @@ class AnkiBridge:
             return templates
 
 
+
+
     def getDeckConfig(self, deck):
         if not deck in self.deckNames():
             return False
@@ -724,13 +832,28 @@ class AnkiBridge:
                     order = info['ord']
                     name = info['name']
                     fields[name] = {'value': note.fields[order], 'order': order}
+                
+                # Get question and answer with version compatibility
+                try:
+                    # Try new Anki 2.1.50+ API
+                    question = card.question()
+                    answer = card.answer()
+                except (AttributeError, TypeError):
+                    # Fall back to older API
+                    try:
+                        qa = card._getQA()
+                        question = qa['q']
+                        answer = qa['a']
+                    except:
+                        question = ""
+                        answer = ""
             
                 result.append({
                     'cardId': card.id,
                     'fields': fields,
                     'fieldOrder': card.ord,
-                    'question': card._getQA()['q'],
-                    'answer': card._getQA()['a'],
+                    'question': question,
+                    'answer': answer,
                     'modelName': model['name'],
                     'deckName': self.deckNameFromId(card.did),
                     'css': model['css'],
@@ -738,7 +861,8 @@ class AnkiBridge:
                     #This factor is 10 times the ease percentage, 
                     # so an ease of 310% would be reported as 3100
                     'interval': card.ivl,
-                    'note': card.nid
+                    'note': card.nid,
+                    'flagged': card.flags > 0
                 })
             except TypeError as e:
                 # Anki will give a TypeError if the card ID does not exist.
@@ -860,17 +984,33 @@ class AnkiBridge:
             name = info['name']
             fields[name] = {'value': note.fields[order], 'order': order}
 
+        # Get question and answer with version compatibility
+        try:
+            # Try new Anki 2.1.50+ API
+            question = card.question()
+            answer = card.answer()
+        except (AttributeError, TypeError):
+            # Fall back to older API
+            try:
+                qa = card._getQA()
+                question = qa['q']
+                answer = qa['a']
+            except:
+                question = ""
+                answer = ""
+
         if card is not None:
             return {
                 'cardId': card.id,
                 'fields': fields,
                 'fieldOrder': card.ord,
-                'question': card._getQA()['q'],
-                'answer': card._getQA()['a'],
+                'question': question,
+                'answer': answer,
                 'buttons': [b[0] for b in reviewer._answerButtonList()],
                 'modelName': model['name'],
                 'deckName': self.deckNameFromId(card.did),
-                'css': model['css']
+                'css': model['css'],
+                'flagged': card.flags > 0
             }
 
 
@@ -947,6 +1087,106 @@ class AnkiBridge:
         timer.timeout.connect(exitAnki)
         timer.start(1000) # 1s should be enough to allow the response to be sent.
 
+    def addAudioNote(self, params, language="en", allowDuplicate=True):
+        """
+        Add a note with TTS audio generation
+        
+        Args:
+            params: Note parameters (deckName, modelName, fields, tags)
+            language: Language code for TTS (e.g., "en", "es", "fr")
+            allowDuplicate: Allow duplicate first field (default: True)
+        
+        Returns:
+            Note ID on success
+        """
+        try:
+            collection = self.collection()
+            if collection is None:
+                raise Exception("Anki collection not available - is Anki running?")
+            
+            # Validate Audio field exists and has content
+            if 'Audio' not in params.get('fields', {}):
+                raise Exception("Audio field is required for addAudioNote. Your note model must have an 'Audio' field.")
+            
+            audio_text = params['fields']['Audio']
+            if not audio_text or not audio_text.strip():
+                raise Exception("Audio field cannot be empty - please provide text to convert to speech")
+            
+            # Validate model exists
+            model_name = params.get('modelName')
+            model = collection.models.byName(model_name)
+            if model is None:
+                available_models = collection.models.allNames()
+                raise Exception(f"Model '{model_name}' not found. Available models: {', '.join(available_models)}")
+            
+            # Check if model has Audio1 field
+            model_fields = [field['name'] for field in model['flds']]
+            if 'Audio1' not in model_fields:
+                raise Exception(f"Model '{model_name}' must have an 'Audio1' field. Current fields: {', '.join(model_fields)}")
+            
+            # Validate deck exists
+            deck_name = params.get('deckName')
+            deck = collection.decks.byName(deck_name)
+            if deck is None:
+                available_decks = collection.decks.allNames()
+                raise Exception(f"Deck '{deck_name}' not found. Available decks: {', '.join(available_decks[:10])}...")
+            
+            # Generate audio using ElevenLabs (voice selected randomly)
+            audio_gen = AudioGenerator()
+            try:
+                audio_data, filename = audio_gen.generate_audio(audio_text, language)
+            except Exception as e:
+                raise Exception(f"Audio generation failed: {str(e)}")
+            
+            # Store audio file in media folder
+            try:
+                self.media().writeData(filename, audio_data)
+            except Exception as e:
+                raise Exception(f"Failed to write audio file to media folder: {str(e)}")
+            
+            # Add audio reference to Audio1 field
+            if 'Audio1' not in params['fields']:
+                params['fields']['Audio1'] = ''
+            params['fields']['Audio1'] += u'[sound:{}]'.format(filename)
+            
+            # Create the note - allow duplicates for audio notes by default
+            note_params = AnkiNoteParams(params)
+            if not note_params.validate():
+                raise Exception(f"Note parameters validation failed. Check deckName, modelName, fields, and tags are all valid strings.")
+            
+            # Create note object
+            model = collection.models.byName(model_name)
+            note = anki.notes.Note(collection, model)
+            note.tags = params.get('tags', [])
+            
+            for name, value in params['fields'].items():
+                if name in note:
+                    note[name] = value
+            
+            # For addAudioNote, always allow duplicates by default
+            # since users often want multiple audio variations of the same word
+            if not allowDuplicate and note.dupeOrEmpty():
+                raise Exception(f"Duplicate note detected. First field '{list(params['fields'].keys())[0]}' already exists with value '{list(params['fields'].values())[0]}'")
+            
+            self.startEditing()
+            collection.addNote(note)
+            
+            # Move the cards to the correct deck after note creation
+            cardIds = [card.id for card in note.cards()]
+            if cardIds and deck['id'] != collection.decks.get_current_id():
+                self.changeDeck(cardIds, deck_name)
+            
+            collection.autosave()
+            self.stopEditing()
+            
+            return note.id
+            
+        except Exception as e:
+            # Re-raise with context
+            raise Exception(f"addAudioNote error: {str(e)}")
+
+
+
 #
 # AnkiConnect
 #
@@ -962,12 +1202,32 @@ class AnkiConnect:
             self.timer = QTimer()
             self.timer.timeout.connect(self.advance)
             self.timer.start(TICK_INTERVAL)
+            
+            # Add menu item for settings
+            self.addSettingsMenu()
         except:
             QMessageBox.critical(
                 self.anki.window(),
                 'AnkiConnect',
                 'Failed to listen on port {}.\nMake sure it is available and is not in use.'.format(NET_PORT)
             )
+
+    def addSettingsMenu(self):
+        """Add menu item to Tools menu for AnkiConnect settings"""
+        try:
+            from aqt import mw
+            from aqt.qt import QAction
+            
+            action = QAction("AnkiConnect Settings", mw)
+            action.triggered.connect(self.onSettingsClicked)
+            mw.form.menuTools.addSeparator()
+            mw.form.menuTools.addAction(action)
+        except:
+            pass  # Ignore if menu setup fails
+
+    def onSettingsClicked(self):
+        """Handle menu item click for settings"""
+        show_settings_dialog(self.anki.window())
 
 
     def advance(self):
@@ -1091,8 +1351,13 @@ class AnkiConnect:
     @webApi()
     def addNote(self, note):
         params = AnkiNoteParams(note)
-        if params.validate():
-            return self.anki.addNote(params)
+        if not params.validate():
+            raise Exception("Note parameters validation failed")
+        
+        result = self.anki.addNote(params)
+        if result is None:
+            raise Exception("Failed to create note - no note ID returned")
+        return result
 
 
     @webApi()
@@ -1274,12 +1539,132 @@ class AnkiConnect:
         return self.anki.guiExitAnki()
 
     @webApi()
+    def addAudioNote(self, note, language="en", allowDuplicate=True):
+        """
+        Add a note with TTS audio generation
+        
+        Args:
+            note: Note parameters (deckName, modelName, fields, tags)
+            language: Language code for TTS (default: "en")
+            allowDuplicate: Allow duplicate notes (default: True)
+        
+        Returns:
+            Note ID on success
+        """
+        return self.anki.addAudioNote(note, language, allowDuplicate)
+
+    @webApi()
     def cardsInfo(self, cards):
         return self.anki.cardsInfo(cards)
 
     @webApi()
     def notesInfo(self, notes):
         return self.anki.notesInfo(notes)
+
+    # Note/Model Management - Simple current profile usage
+    @webApi()
+    def createModel(self, modelName, fields, templates, css=""):
+        return NoteManager(self.anki).createModel(modelName, fields, templates, css)
+
+    @webApi()
+    def updateModel(self, modelId, modelName=None, fields=None, templates=None, css=None):
+        return NoteManager(self.anki).updateModel(modelId, modelName, fields, templates, css)
+
+    @webApi()
+    def deleteModel(self, modelId):
+        return NoteManager(self.anki).deleteModel(modelId)
+
+    @webApi()
+    def createDeck(self, deckName):
+        return NoteManager(self.anki).createDeck(deckName)
+
+    @webApi()
+    def getModelInfo(self, modelId):
+        return NoteManager(self.anki).getModelInfo(modelId)
+
+    @webApi()
+    def getDeckInfo(self, deckName, includeTimeStats=True, period="allTime"):
+        return NoteManager(self.anki).getDeckInfo(deckName, includeTimeStats, period)
+
+    @webApi()
+    def deleteDeck(self, deckName, deleteCards=False):
+        return NoteManager(self.anki).deleteDeck(deckName, deleteCards)
+
+    @webApi()
+    def renameDeck(self, oldName, newName):
+        return NoteManager(self.anki).renameDeck(oldName, newName)
+
+    # Study Management - Direct usage  
+    @webApi()
+    def getNextReviewCard(self, deckName=None):
+        return StudyManager(self.anki).getNextReviewCard(deckName)
+
+    @webApi()
+    def answerCard(self, cardId, ease):
+        return StudyManager(self.anki).answerCard(cardId, ease)
+
+    @webApi()
+    def resetCard(self, cardId):
+        return StudyManager(self.anki).resetCard(cardId)
+
+    @webApi()
+    def forgetCard(self, cardId):
+        return StudyManager(self.anki).forgetCard(cardId)
+
+    @webApi()
+    def getDueCards(self, deckName=None, limit=10):
+        return StudyManager(self.anki).getDueCards(deckName, limit)
+
+    @webApi()
+    def getNewCards(self, deckName=None, limit=10):
+        return StudyManager(self.anki).getNewCards(deckName, limit)
+
+    @webApi()
+    def getStudyStats(self, deckName=None):
+        return StudyManager(self.anki).getStudyStats(deckName)
+
+    @webApi()
+    def getDeckTimeStats(self, deckName=None, period="allTime"):
+        return StudyManager(self.anki).getDeckTimeStats(deckName, period)
+
+    @webApi()
+    def flagCard(self, cardId):
+        """
+        Flag a card with red flag
+        
+        Args:
+            cardId (int): ID of the card to flag
+            
+        Returns:
+            bool: True if successful
+        """
+        return self.anki.flagCard(cardId)
+
+    @webApi()
+    def unflagCard(self, cardId):
+        """
+        Remove flag from a card
+        
+        Args:
+            cardId (int): ID of the card to unflag
+            
+        Returns:
+            bool: True if successful
+        """
+        return self.anki.unflagCard(cardId)
+
+    @webApi()
+    def isCardFlagged(self, cardId):
+        """
+        Check if a card is flagged
+        
+        Args:
+            cardId (int): ID of the card to check
+            
+        Returns:
+            bool: True if card is flagged
+        """
+        return self.anki.isCardFlagged(cardId)
 
 #
 #   Entry
