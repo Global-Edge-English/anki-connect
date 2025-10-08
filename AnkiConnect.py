@@ -1522,8 +1522,8 @@ class AnkiConnect:
         return NoteManager(self.anki).getModelInfo(modelId)
 
     @webApi()
-    def getDeckInfo(self, deckName):
-        return NoteManager(self.anki).getDeckInfo(deckName)
+    def getDeckInfo(self, deckName, includeTimeStats=True, period="allTime"):
+        return NoteManager(self.anki).getDeckInfo(deckName, includeTimeStats, period)
 
     @webApi()
     def deleteDeck(self, deckName, deleteCards=False):
@@ -1561,6 +1561,10 @@ class AnkiConnect:
     @webApi()
     def getStudyStats(self, deckName=None):
         return StudyManager(self.anki).getStudyStats(deckName)
+
+    @webApi()
+    def getDeckTimeStats(self, deckName=None, period="allTime"):
+        return StudyManager(self.anki).getDeckTimeStats(deckName, period)
 
 #
 #   Entry

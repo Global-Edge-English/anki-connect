@@ -325,3 +325,93 @@ class StudyManager:
             'totalCards': totalCount,
             'studiedToday': studiedToday
         }
+    
+    def getDeckTimeStats(self, deckName=None, period="allTime"):
+        """
+        Get time statistics for a deck showing average seconds per card
+        
+        Args:
+            deckName (str, optional): Name of the deck (None for all decks)
+            period (str): Time period - "today", "last7days", "last30days", "allTime"
+            
+        Returns:
+            dict: Time statistics including average time per card
+        """
+        collection = self.collection()
+        if collection is None:
+            return None
+        
+        from datetime import datetime, timedelta
+        
+        # Calculate timestamp based on period
+        if period == "today":
+            cutoff = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            cutoffTimestamp = int(cutoff.timestamp() * 1000)
+            periodDesc = "today"
+        elif period == "last7days":
+            cutoff = datetime.now() - timedelta(days=7)
+            cutoffTimestamp = int(cutoff.timestamp() * 1000)
+            periodDesc = "last 7 days"
+        elif period == "last30days":
+            cutoff = datetime.now() - timedelta(days=30)
+            cutoffTimestamp = int(cutoff.timestamp() * 1000)
+            periodDesc = "last 30 days"
+        else:  # allTime
+            cutoffTimestamp = 0
+            periodDesc = "all time"
+        
+        # Build deck filter
+        if deckName:
+            deck = collection.decks.byName(deckName)
+            if deck is None:
+                raise Exception(f"Deck '{deckName}' does not exist")
+            
+            # Get all deck IDs for this deck and its children
+            # This includes the parent deck and all nested child decks
+            deckIds = [deck['id']]
+            for deckId, deckObj in collection.decks.decks.items():
+                # Check if this deck is a child of the specified deck
+                if deckObj['name'].startswith(deckName + '::'):
+                    deckIds.append(int(deckId))
+            
+            # Create filter for all these decks
+            deckIdsStr = ','.join(str(did) for did in deckIds)
+            deckFilter = f"and cid in (select id from cards where did in ({deckIdsStr}))"
+        else:
+            deckFilter = ""
+        
+        # Query review log for time statistics
+        # time column in revlog is in milliseconds
+        query = f"""
+            select 
+                count(*) as review_count,
+                sum(time) as total_time_ms,
+                avg(time) as avg_time_ms
+            from revlog 
+            where id > ? {deckFilter}
+        """
+        
+        result = collection.db.first(query, cutoffTimestamp)
+        
+        if result is None or result[0] == 0:
+            return {
+                'deckName': deckName or 'All Decks',
+                'period': periodDesc,
+                'totalReviews': 0,
+                'totalTimeSeconds': 0.0,
+                'averageTimePerCardSeconds': 0.0
+            }
+        
+        review_count, total_time_ms, avg_time_ms = result
+        
+        # Convert milliseconds to seconds
+        total_time_seconds = (total_time_ms / 1000.0) if total_time_ms else 0.0
+        avg_time_seconds = (avg_time_ms / 1000.0) if avg_time_ms else 0.0
+        
+        return {
+            'deckName': deckName or 'All Decks',
+            'period': periodDesc,
+            'totalReviews': review_count,
+            'totalTimeSeconds': round(total_time_seconds, 2),
+            'averageTimePerCardSeconds': round(avg_time_seconds, 2)
+        }

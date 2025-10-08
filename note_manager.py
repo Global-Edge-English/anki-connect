@@ -310,15 +310,17 @@ class NoteManager:
             'noteCount': collection.models.useCount(model)
         }
 
-    def getDeckInfo(self, deckName):
+    def getDeckInfo(self, deckName, includeTimeStats=True, period="allTime"):
         """
-        Get detailed information about a deck
+        Get detailed information about a deck (includes child decks)
         
         Args:
             deckName (str): Name of the deck
+            includeTimeStats (bool): Whether to include time statistics (default: True)
+            period (str): Time period for stats - "today", "last7days", "last30days", "allTime"
             
         Returns:
-            dict: Deck information
+            dict: Deck information including child deck cards and time stats
         """
         collection = self.collection()
         if collection is None:
@@ -327,17 +329,25 @@ class NoteManager:
         deck = collection.decks.byName(deckName)
         if deck is None:
             return None
-            
-        # Get card counts using database queries for compatibility
-        deckId = deck['id']
         
-        # Get card counts directly from database
-        newCount = collection.db.scalar("select count() from cards where did = ? and queue = 0", deckId) or 0
-        lrnCount = collection.db.scalar("select count() from cards where did = ? and queue in (1, 3)", deckId) or 0 
-        revCount = collection.db.scalar("select count() from cards where did = ? and queue = 2", deckId) or 0
-        totalCount = collection.db.scalar("select count() from cards where did = ?", deckId) or 0
+        # Get all deck IDs for this deck and its children
+        # This includes the parent deck and all nested child decks
+        deckIds = [deck['id']]
+        for deckId, deckObj in collection.decks.decks.items():
+            # Check if this deck is a child of the specified deck
+            if deckObj['name'].startswith(deckName + '::'):
+                deckIds.append(int(deckId))
         
-        return {
+        # Create filter for all these decks
+        deckIdsStr = ','.join(str(did) for did in deckIds)
+        
+        # Get card counts for parent deck and all child decks
+        newCount = collection.db.scalar(f"select count() from cards where did in ({deckIdsStr}) and queue = 0") or 0
+        lrnCount = collection.db.scalar(f"select count() from cards where did in ({deckIdsStr}) and queue in (1, 3)") or 0 
+        revCount = collection.db.scalar(f"select count() from cards where did in ({deckIdsStr}) and queue = 2") or 0
+        totalCount = collection.db.scalar(f"select count() from cards where did in ({deckIdsStr})") or 0
+        
+        result = {
             'id': deck['id'],
             'name': deck['name'],
             'newCount': newCount,
@@ -345,3 +355,57 @@ class NoteManager:
             'reviewCount': revCount,
             'totalCards': totalCount
         }
+        
+        # Add time statistics if requested
+        if includeTimeStats:
+            from datetime import datetime, timedelta
+            
+            # Calculate timestamp based on period
+            if period == "today":
+                cutoff = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                cutoffTimestamp = int(cutoff.timestamp() * 1000)
+                periodDesc = "today"
+            elif period == "last7days":
+                cutoff = datetime.now() - timedelta(days=7)
+                cutoffTimestamp = int(cutoff.timestamp() * 1000)
+                periodDesc = "last 7 days"
+            elif period == "last30days":
+                cutoff = datetime.now() - timedelta(days=30)
+                cutoffTimestamp = int(cutoff.timestamp() * 1000)
+                periodDesc = "last 30 days"
+            else:  # allTime
+                cutoffTimestamp = 0
+                periodDesc = "all time"
+            
+            # Query review log for time statistics
+            query = f"""
+                select 
+                    count(*) as review_count,
+                    sum(time) as total_time_ms,
+                    avg(time) as avg_time_ms
+                from revlog 
+                where id > ? and cid in (select id from cards where did in ({deckIdsStr}))
+            """
+            
+            timeResult = collection.db.first(query, cutoffTimestamp)
+            
+            if timeResult and timeResult[0] > 0:
+                review_count, total_time_ms, avg_time_ms = timeResult
+                total_time_seconds = (total_time_ms / 1000.0) if total_time_ms else 0.0
+                avg_time_seconds = (avg_time_ms / 1000.0) if avg_time_ms else 0.0
+                
+                result['timeStats'] = {
+                    'period': periodDesc,
+                    'totalReviews': review_count,
+                    'totalTimeSeconds': round(total_time_seconds, 2),
+                    'averageTimePerCardSeconds': round(avg_time_seconds, 2)
+                }
+            else:
+                result['timeStats'] = {
+                    'period': periodDesc,
+                    'totalReviews': 0,
+                    'totalTimeSeconds': 0.0,
+                    'averageTimePerCardSeconds': 0.0
+                }
+        
+        return result
