@@ -91,7 +91,8 @@ class StudyManager:
             'queue': card.queue,
             'type': card.type,
             'noteId': card.nid,
-            'buttons': self._getAnswerButtons(card)
+            'buttons': self._getAnswerButtons(card),
+            'flagged': card.flags > 0
         }
     
     def answerCard(self, cardId, ease):

@@ -527,6 +527,65 @@ class AnkiBridge:
         return suspended
 
 
+    def flagCard(self, cardId):
+        """Flag a card with red flag (flag value 1)"""
+        collection = self.collection()
+        if collection is None:
+            return False
+        
+        try:
+            card = collection.getCard(cardId)
+            if card is None:
+                raise Exception(f"Card with ID '{cardId}' does not exist")
+            
+            self.startEditing()
+            card.flags = 1  # Red flag
+            card.flush()
+            collection.autosave()
+            self.stopEditing()
+            return True
+        except Exception as e:
+            self.stopEditing()
+            raise e
+
+
+    def unflagCard(self, cardId):
+        """Remove flag from a card (set flag value to 0)"""
+        collection = self.collection()
+        if collection is None:
+            return False
+        
+        try:
+            card = collection.getCard(cardId)
+            if card is None:
+                raise Exception(f"Card with ID '{cardId}' does not exist")
+            
+            self.startEditing()
+            card.flags = 0  # No flag
+            card.flush()
+            collection.autosave()
+            self.stopEditing()
+            return True
+        except Exception as e:
+            self.stopEditing()
+            raise e
+
+
+    def isCardFlagged(self, cardId):
+        """Check if a card is flagged"""
+        collection = self.collection()
+        if collection is None:
+            return False
+        
+        try:
+            card = collection.getCard(cardId)
+            if card is None:
+                raise Exception(f"Card with ID '{cardId}' does not exist")
+            return card.flags > 0
+        except Exception as e:
+            raise e
+
+
     def areDue(self, cards):
         due = []
         for card in cards:
@@ -802,7 +861,8 @@ class AnkiBridge:
                     #This factor is 10 times the ease percentage, 
                     # so an ease of 310% would be reported as 3100
                     'interval': card.ivl,
-                    'note': card.nid
+                    'note': card.nid,
+                    'flagged': card.flags > 0
                 })
             except TypeError as e:
                 # Anki will give a TypeError if the card ID does not exist.
@@ -949,7 +1009,8 @@ class AnkiBridge:
                 'buttons': [b[0] for b in reviewer._answerButtonList()],
                 'modelName': model['name'],
                 'deckName': self.deckNameFromId(card.did),
-                'css': model['css']
+                'css': model['css'],
+                'flagged': card.flags > 0
             }
 
 
@@ -1565,6 +1626,45 @@ class AnkiConnect:
     @webApi()
     def getDeckTimeStats(self, deckName=None, period="allTime"):
         return StudyManager(self.anki).getDeckTimeStats(deckName, period)
+
+    @webApi()
+    def flagCard(self, cardId):
+        """
+        Flag a card with red flag
+        
+        Args:
+            cardId (int): ID of the card to flag
+            
+        Returns:
+            bool: True if successful
+        """
+        return self.anki.flagCard(cardId)
+
+    @webApi()
+    def unflagCard(self, cardId):
+        """
+        Remove flag from a card
+        
+        Args:
+            cardId (int): ID of the card to unflag
+            
+        Returns:
+            bool: True if successful
+        """
+        return self.anki.unflagCard(cardId)
+
+    @webApi()
+    def isCardFlagged(self, cardId):
+        """
+        Check if a card is flagged
+        
+        Args:
+            cardId (int): ID of the card to check
+            
+        Returns:
+            bool: True if card is flagged
+        """
+        return self.anki.isCardFlagged(cardId)
 
 #
 #   Entry
