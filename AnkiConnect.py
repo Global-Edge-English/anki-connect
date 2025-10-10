@@ -150,15 +150,44 @@ def verifyStringList(strings):
     return True
 
 
+def getMimeType(filename):
+    """Get MIME type based on file extension"""
+    ext = os.path.splitext(filename)[1].lower()
+    mime_types = {
+        '.mp3': 'audio/mpeg',
+        '.wav': 'audio/wav',
+        '.ogg': 'audio/ogg',
+        '.m4a': 'audio/mp4',
+        '.flac': 'audio/flac',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.svg': 'image/svg+xml',
+        '.mp4': 'video/mp4',
+        '.webm': 'video/webm',
+        '.txt': 'text/plain',
+        '.html': 'text/html',
+        '.css': 'text/css',
+        '.js': 'application/javascript',
+        '.json': 'application/json',
+        '.pdf': 'application/pdf'
+    }
+    return mime_types.get(ext, 'application/octet-stream')
+
+
 
 #
 # AjaxRequest
 #
 
 class AjaxRequest:
-    def __init__(self, headers, body):
+    def __init__(self, headers, body, method='POST', path='/'):
         self.headers = headers
         self.body = body
+        self.method = method
+        self.path = path
 
 
 #
@@ -216,8 +245,19 @@ class AjaxClient:
         if len(parts) == 1:
             return None, 0
 
+        # Parse request line to extract method and path
+        request_lines = parts[0].split(makeBytes('\r\n'))
+        if len(request_lines) > 0:
+            request_line = makeStr(request_lines[0])
+            request_parts = request_line.split(' ')
+            method = request_parts[0] if len(request_parts) > 0 else 'POST'
+            path = request_parts[1] if len(request_parts) > 1 else '/'
+        else:
+            method = 'POST'
+            path = '/'
+
         headers = {}
-        for line in parts[0].split(makeBytes('\r\n')):
+        for line in request_lines[1:]:  # Skip the request line
             pair = line.split(makeBytes(': '))
             headers[pair[0].lower()] = pair[1] if len(pair) > 1 else None
 
@@ -229,7 +269,7 @@ class AjaxClient:
             return None, 0
 
         body = data[headerLength : totalLength]
-        return AjaxRequest(headers, body), totalLength
+        return AjaxRequest(headers, body, method, path), totalLength
 
 
 #
@@ -296,6 +336,11 @@ class AjaxServer:
 
 
     def handlerWrapper(self, req):
+        # Check if this is a GET request for media files
+        if req.method == 'GET' and req.path.startswith('/media/'):
+            return self.serveMediaFile(req)
+        
+        # Normal API request handling
         if len(req.body) == 0:
             body = makeBytes('AnkiConnect v.{}'.format(API_VERSION))
         else:
@@ -319,6 +364,73 @@ class AjaxServer:
         resp += makeBytes('\r\n')
         resp += body
 
+        return resp
+
+    def serveMediaFile(self, req):
+        """Serve media files directly via HTTP"""
+        try:
+            # Extract filename from path (e.g., /media/audio_123.mp3 -> audio_123.mp3)
+            filename = req.path[7:]  # Remove '/media/' prefix
+            if not filename:
+                return self.createErrorResponse(400, 'Bad Request: No filename provided')
+            
+            # Security: prevent directory traversal
+            filename = os.path.basename(filename)
+            filename = normalize("NFC", filename)
+            
+            # Get media directory from Anki
+            from aqt import mw
+            if mw is None or mw.col is None or mw.col.media is None:
+                return self.createErrorResponse(503, 'Service Unavailable: Anki not ready')
+            
+            media_dir = mw.col.media.dir()
+            filepath = os.path.join(media_dir, filename)
+            
+            # Check if file exists
+            if not os.path.exists(filepath):
+                return self.createErrorResponse(404, 'Not Found: Media file does not exist')
+            
+            # Read file content
+            with open(filepath, 'rb') as f:
+                file_content = f.read()
+            
+            # Determine MIME type
+            mime_type = getMimeType(filename)
+            
+            # Build response
+            resp = bytes()
+            resp += makeBytes('HTTP/1.1 200 OK\r\n')
+            resp += makeBytes('Content-Type: {}\r\n'.format(mime_type))
+            resp += makeBytes('Content-Length: {}\r\n'.format(len(file_content)))
+            resp += makeBytes('Access-Control-Allow-Origin: *\r\n')
+            resp += makeBytes('Cache-Control: public, max-age=31536000\r\n')  # Cache for 1 year
+            resp += makeBytes('\r\n')
+            resp += file_content
+            
+            return resp
+            
+        except Exception as e:
+            return self.createErrorResponse(500, 'Internal Server Error: {}'.format(str(e)))
+    
+    def createErrorResponse(self, status_code, message):
+        """Create an HTTP error response"""
+        status_messages = {
+            400: 'Bad Request',
+            404: 'Not Found',
+            500: 'Internal Server Error',
+            503: 'Service Unavailable'
+        }
+        status_text = status_messages.get(status_code, 'Error')
+        
+        body = makeBytes(message)
+        resp = bytes()
+        resp += makeBytes('HTTP/1.1 {} {}\r\n'.format(status_code, status_text))
+        resp += makeBytes('Content-Type: text/plain\r\n')
+        resp += makeBytes('Content-Length: {}\r\n'.format(len(body)))
+        resp += makeBytes('Access-Control-Allow-Origin: *\r\n')
+        resp += makeBytes('\r\n')
+        resp += body
+        
         return resp
 
 
