@@ -95,13 +95,15 @@ class StudyManager:
             'flagged': card.flags > 0
         }
     
-    def answerCard(self, cardId, ease):
+    def answerCard(self, cardId, ease, timeTakenSeconds=None):
         """
         Answer a card with the specified ease
         
         Args:
             cardId (int): ID of the card to answer
             ease (int): Ease/difficulty rating (1=Again, 2=Hard, 3=Good, 4=Easy)
+            timeTakenSeconds (float, optional): Time taken to answer in seconds. 
+                                               If not provided, defaults to 0.
             
         Returns:
             bool: True if successful
@@ -121,15 +123,27 @@ class StudyManager:
             
             self.startEditing()
             
-            # Start the timer on the card before answering
-            # This is required because answerCard expects timing information
-            # that is normally set when the card is retrieved via getCard()
+            # Start the timer
             card.startTimer()
             
             # Answer the card
             collection.sched.answerCard(card, ease)
-            collection.autosave()
             
+            # If custom time was provided, update the revlog entry directly
+            if timeTakenSeconds is not None:
+                # Convert seconds to milliseconds
+                time_ms = int(timeTakenSeconds * 1000)
+                
+                # Update the most recent revlog entry for this card
+                # The entry was just created by answerCard()
+                collection.db.execute(
+                    "UPDATE revlog SET time = ? WHERE id = ("
+                    "SELECT id FROM revlog WHERE cid = ? ORDER BY id DESC LIMIT 1"
+                    ")",
+                    time_ms, cardId
+                )
+            
+            collection.autosave()
             self.stopEditing()
             return True
             

@@ -1564,6 +1564,41 @@ class AnkiConnect:
     @webApi()
     def version(self):
         return API_VERSION
+    
+    @webApi()
+    def debugInfo(self):
+        """Debug endpoint to check what methods are available"""
+        import sys
+        info = {
+            'apiVersion': API_VERSION,
+            'ankiConnectFile': __file__,
+            'studyManagerFile': None,
+            'availableMethods': [],
+            'answerCardSignature': None
+        }
+        
+        # Get study_manager file location
+        try:
+            import study_manager
+            info['studyManagerFile'] = study_manager.__file__
+        except:
+            pass
+        
+        # Check answerCard method signature
+        try:
+            import inspect as insp
+            sig = insp.signature(self.answerCard)
+            info['answerCardSignature'] = str(sig)
+            info['answerCardParameters'] = list(sig.parameters.keys())
+        except Exception as e:
+            info['answerCardSignature'] = f"Error: {str(e)}"
+        
+        # List all @webApi methods
+        for methodName, methodInst in inspect.getmembers(self, predicate=inspect.ismethod):
+            if getattr(methodInst, 'api', False):
+                info['availableMethods'].append(methodName)
+        
+        return info
 
 
     @webApi()
@@ -1712,8 +1747,8 @@ class AnkiConnect:
         return StudyManager(self.anki).getNextReviewCard(deckName)
 
     @webApi()
-    def answerCard(self, cardId, ease):
-        return StudyManager(self.anki).answerCard(cardId, ease)
+    def answerCard(self, cardId, ease, timeTakenSeconds=None):
+        return StudyManager(self.anki).answerCard(cardId, ease, timeTakenSeconds)
 
     @webApi()
     def resetCard(self, cardId):
