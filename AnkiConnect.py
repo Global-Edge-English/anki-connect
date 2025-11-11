@@ -45,19 +45,6 @@ except ImportError:
     import study_manager
     StudyManager = study_manager.StudyManager
 
-try:
-    from .audio_generator import AudioGenerator
-except ImportError:
-    # Fallback for older Python versions or different import contexts
-    import audio_generator
-    AudioGenerator = audio_generator.AudioGenerator
-
-try:
-    from .settings_dialog import show_settings_dialog
-except ImportError:
-    # Fallback for older Python versions or different import contexts
-    import settings_dialog
-    show_settings_dialog = settings_dialog.show_settings_dialog
 
 
 #
@@ -1199,13 +1186,13 @@ class AnkiBridge:
         timer.timeout.connect(exitAnki)
         timer.start(1000) # 1s should be enough to allow the response to be sent.
 
-    def addAudioNote(self, params, language="en", allowDuplicate=True):
+    def addAudioNote(self, params, audioFile, allowDuplicate=True):
         """
-        Add a note with TTS audio generation
+        Add a note with audio file from URL
         
         Args:
             params: Note parameters (deckName, modelName, fields, tags)
-            language: Language code for TTS (e.g., "en", "es", "fr")
+            audioFile: URL to MP3 file (e.g., Digital Ocean Spaces URL)
             allowDuplicate: Allow duplicate first field (default: True)
         
         Returns:
@@ -1215,14 +1202,6 @@ class AnkiBridge:
             collection = self.collection()
             if collection is None:
                 raise Exception("Anki collection not available - is Anki running?")
-            
-            # Validate Audio field exists and has content
-            if 'Audio' not in params.get('fields', {}):
-                raise Exception("Audio field is required for addAudioNote. Your note model must have an 'Audio' field.")
-            
-            audio_text = params['fields']['Audio']
-            if not audio_text or not audio_text.strip():
-                raise Exception("Audio field cannot be empty - please provide text to convert to speech")
             
             # Validate model exists
             model_name = params.get('modelName')
@@ -1243,28 +1222,56 @@ class AnkiBridge:
                 available_decks = collection.decks.allNames()
                 raise Exception(f"Deck '{deck_name}' not found. Available decks: {', '.join(available_decks[:10])}...")
             
-            # Generate audio using ElevenLabs (voice selected randomly)
-            audio_gen = AudioGenerator()
+            # Validate audioFile
+            if not audioFile or not verifyString(audioFile):
+                raise Exception("audioFile is required and must be a valid URL string")
+            
+            # Download audio file from URL
             try:
-                audio_data, filename = audio_gen.generate_audio(audio_text, language)
+                audio_data = download(audioFile)
+                if audio_data is None:
+                    raise Exception(f"Failed to download audio from URL: {audioFile}")
             except Exception as e:
-                raise Exception(f"Audio generation failed: {str(e)}")
+                raise Exception(f"Failed to download audio from URL: {str(e)}")
+            
+            # Validate that we got audio data
+            if not audio_data or len(audio_data) == 0:
+                raise Exception("Downloaded file is empty")
+            
+            # Generate filename from URL
+            import urllib.parse
+            parsed_url = urllib.parse.urlparse(audioFile)
+            url_filename = os.path.basename(parsed_url.path)
+            
+            if url_filename and '.' in url_filename:
+                # Use filename from URL with unique timestamp
+                timestamp = int(time())
+                name, ext = os.path.splitext(url_filename)
+                audioFilename = f"{name}_{timestamp}{ext}"
+            else:
+                # Generate completely new filename
+                timestamp = int(time())
+                url_hash = hashlib.md5(audioFile.encode('utf-8')).hexdigest()[:8]
+                audioFilename = f"audio_{timestamp}_{url_hash}.mp3"
+            
+            # Ensure filename has no directory components
+            audioFilename = os.path.basename(audioFilename)
             
             # Store audio file in media folder
             try:
-                self.media().writeData(filename, audio_data)
+                self.media().writeData(audioFilename, audio_data)
             except Exception as e:
                 raise Exception(f"Failed to write audio file to media folder: {str(e)}")
             
             # Add audio reference to Audio1 field
             if 'Audio1' not in params['fields']:
                 params['fields']['Audio1'] = ''
-            params['fields']['Audio1'] += u'[sound:{}]'.format(filename)
+            params['fields']['Audio1'] += u'[sound:{}]'.format(audioFilename)
             
-            # Create the note - allow duplicates for audio notes by default
+            # Create the note
             note_params = AnkiNoteParams(params)
             if not note_params.validate():
-                raise Exception(f"Note parameters validation failed. Check deckName, modelName, fields, and tags are all valid strings.")
+                raise Exception("Note parameters validation failed. Check deckName, modelName, fields, and tags are all valid strings.")
             
             # Create note object
             model = collection.models.byName(model_name)
@@ -1275,10 +1282,9 @@ class AnkiBridge:
                 if name in note:
                     note[name] = value
             
-            # For addAudioNote, always allow duplicates by default
-            # since users often want multiple audio variations of the same word
+            # Check for duplicates if not allowed
             if not allowDuplicate and note.dupeOrEmpty():
-                raise Exception(f"Duplicate note detected. First field '{list(params['fields'].keys())[0]}' already exists with value '{list(params['fields'].values())[0]}'")
+                raise Exception(f"Duplicate note detected. First field already exists.")
             
             self.startEditing()
             collection.addNote(note)
@@ -1314,32 +1320,12 @@ class AnkiConnect:
             self.timer = QTimer()
             self.timer.timeout.connect(self.advance)
             self.timer.start(TICK_INTERVAL)
-            
-            # Add menu item for settings
-            self.addSettingsMenu()
         except:
             QMessageBox.critical(
                 self.anki.window(),
                 'AnkiConnect',
                 'Failed to listen on port {}.\nMake sure it is available and is not in use.'.format(NET_PORT)
             )
-
-    def addSettingsMenu(self):
-        """Add menu item to Tools menu for AnkiConnect settings"""
-        try:
-            from aqt import mw
-            from aqt.qt import QAction
-            
-            action = QAction("AnkiConnect Settings", mw)
-            action.triggered.connect(self.onSettingsClicked)
-            mw.form.menuTools.addSeparator()
-            mw.form.menuTools.addAction(action)
-        except:
-            pass  # Ignore if menu setup fails
-
-    def onSettingsClicked(self):
-        """Handle menu item click for settings"""
-        show_settings_dialog(self.anki.window())
 
 
     def advance(self):
@@ -1686,19 +1672,19 @@ class AnkiConnect:
         return self.anki.guiExitAnki()
 
     @webApi()
-    def addAudioNote(self, note, language="en", allowDuplicate=True):
+    def addAudioNote(self, note, audioFile, allowDuplicate=True):
         """
-        Add a note with TTS audio generation
+        Add a note with audio file from URL
         
         Args:
             note: Note parameters (deckName, modelName, fields, tags)
-            language: Language code for TTS (default: "en")
+            audioFile: URL to MP3 file (e.g., Digital Ocean Spaces URL)
             allowDuplicate: Allow duplicate notes (default: True)
         
         Returns:
             Note ID on success
         """
-        return self.anki.addAudioNote(note, language, allowDuplicate)
+        return self.anki.addAudioNote(note, audioFile, allowDuplicate)
 
     @webApi()
     def cardsInfo(self, cards):
