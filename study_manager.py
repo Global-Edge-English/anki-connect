@@ -430,3 +430,291 @@ class StudyManager:
             'totalTimeSeconds': round(total_time_seconds, 2),
             'averageTimePerCardSeconds': round(avg_time_seconds, 2)
         }
+    
+    def setDeckStudyOptions(self, deckName, newCardsPerDay=None, reviewsPerDay=None):
+        """
+        Set study options for a specific deck only (new cards per day and/or reviews per day)
+        This will create a deck-specific config if the deck is currently using a shared config.
+        
+        Args:
+            deckName (str): Name of the deck to configure
+            newCardsPerDay (int, optional): Maximum new cards to study per day
+            reviewsPerDay (int, optional): Maximum review cards per day
+            
+        Returns:
+            dict: Updated configuration with the new settings
+        """
+        collection = self.collection()
+        if collection is None:
+            raise Exception("Collection not available")
+        
+        # Get the deck
+        deck = collection.decks.byName(deckName)
+        if deck is None:
+            raise Exception(f"Deck '{deckName}' does not exist")
+        
+        deck_id = deck['id']
+        current_config_id = deck.get('conf', 1)
+        
+        self.startEditing()
+        
+        try:
+            # Check if this config is shared by other decks
+            decks_using_config = []
+            for did, d in collection.decks.decks.items():
+                if d.get('conf') == current_config_id and did != str(deck_id):
+                    decks_using_config.append(d['name'])
+            
+            # If config is shared, clone it for this deck only
+            if len(decks_using_config) > 0:
+                # Clone the current config
+                current_config = collection.decks.getConf(current_config_id)
+                new_config_name = f"{deckName} Options"
+                new_config_id = collection.decks.confId(new_config_name, current_config)
+                
+                # Assign the new config to this deck
+                deck['conf'] = new_config_id
+                collection.decks.save(deck)
+                
+                # Get the newly created config
+                config = collection.decks.getConf(new_config_id)
+            else:
+                # Config is not shared, safe to modify directly
+                config = collection.decks.confForDid(deck_id)
+            
+            if config is None:
+                raise Exception(f"Could not get configuration for deck '{deckName}'")
+            
+            # Update new cards per day if specified
+            if newCardsPerDay is not None:
+                if newCardsPerDay < 0:
+                    raise Exception("newCardsPerDay must be >= 0")
+                config['new']['perDay'] = newCardsPerDay
+            
+            # Update reviews per day if specified
+            if reviewsPerDay is not None:
+                if reviewsPerDay < 0:
+                    raise Exception("reviewsPerDay must be >= 0")
+                config['rev']['perDay'] = reviewsPerDay
+            
+            # Save the configuration
+            config['mod'] = anki.utils.intTime()
+            config['usn'] = collection.usn()
+            collection.decks.save(config)
+            collection.autosave()
+            
+            self.stopEditing()
+            
+            return {
+                'deckName': deckName,
+                'configId': config['id'],
+                'configName': config['name'],
+                'newCardsPerDay': config['new']['perDay'],
+                'reviewsPerDay': config['rev']['perDay'],
+                'wasShared': len(decks_using_config) > 0,
+                'createdNewConfig': len(decks_using_config) > 0
+            }
+            
+        except Exception as e:
+            self.stopEditing()
+            raise e
+    
+    def extendNewCardLimit(self, deckName, additionalCards):
+        """
+        Extend today's new card limit for a specific deck using Anki's backend custom study API.
+        Uses the same mechanism as Anki's native "Increase today's new card limit" option.
+        This properly extends TODAY's limit without permanently modifying deck configuration.
+        
+        Args:
+            deckName (str): Name of the deck
+            additionalCards (int): Number of additional new cards to allow today
+            
+        Returns:
+            dict: Information about the extended limit
+        """
+        collection = self.collection()
+        if collection is None:
+            raise Exception("Collection not available")
+        
+        # Get the deck
+        deck = collection.decks.byName(deckName)
+        if deck is None:
+            raise Exception(f"Deck '{deckName}' does not exist")
+        
+        if additionalCards <= 0:
+            raise Exception("additionalCards must be > 0")
+        
+        deck_id = deck['id']
+        
+        self.startEditing()
+        
+        try:
+            # Use Anki's backend custom_study API (same as the UI uses)
+            from anki.scheduler import CustomStudyRequest
+            
+            request = CustomStudyRequest()
+            request.deck_id = deck_id
+            request.new_limit_delta = additionalCards
+            
+            # This extends the limit using Anki's Rust backend
+            collection.sched.custom_study(request)
+            
+            # Get updated deck to read the extendNew value
+            deck = collection.decks.get(deck_id)
+            extend_new = deck.get('extendNew', additionalCards)
+            
+            collection.autosave()
+            self.stopEditing()
+            
+            return {
+                'deckName': deckName,
+                'additionalCardsAllowed': additionalCards,
+                'totalExtended': extend_new,
+                'message': f"Extended new card limit by {additionalCards} cards for today"
+            }
+            
+        except Exception as e:
+            self.stopEditing()
+            raise e
+    
+    def enableStudyForgotten(self, deckName, days=1, filteredDeckName=None):
+        """
+        Enable studying cards that were forgotten (answered "Again") in the last X days.
+        Creates a filtered deck for reviewing forgotten cards.
+        Uses Anki's backend custom_study API to match native behavior exactly.
+        
+        Args:
+            deckName (str): Name of the source deck
+            days (int): Look back this many days for forgotten cards (default: 1 = today only)
+            filteredDeckName (str, optional): Custom name for the filtered deck. If not provided, uses Anki's default.
+            
+        Returns:
+            dict: Information about the created filtered deck
+        """
+        collection = self.collection()
+        if collection is None:
+            raise Exception("Collection not available")
+        
+        # Verify source deck exists
+        source_deck = collection.decks.byName(deckName)
+        if source_deck is None:
+            raise Exception(f"Deck '{deckName}' does not exist")
+        
+        if days <= 0:
+            raise Exception("days must be > 0")
+        
+        deck_id = source_deck['id']
+        
+        self.startEditing()
+        
+        try:
+            # Use Anki's backend custom_study API (same as the UI uses)
+            from anki.scheduler import CustomStudyRequest
+            
+            request = CustomStudyRequest()
+            request.deck_id = deck_id
+            request.forgot_days = days
+            
+            # This creates the filtered deck using Anki's Rust backend
+            collection.sched.custom_study(request)
+            
+            # Get the created filtered deck (Anki names it "Custom Study Session")
+            filtered_deck_name = "Custom Study Session"
+            filtered_deck = collection.decks.byName(filtered_deck_name)
+            
+            if filtered_deck is None:
+                raise Exception("Failed to create custom study deck")
+            
+            # If custom name requested, rename it
+            if filteredDeckName and filteredDeckName != filtered_deck_name:
+                filtered_deck['name'] = filteredDeckName
+                collection.decks.save(filtered_deck)
+                collection.decks.rename(filtered_deck, filteredDeckName)
+                filtered_deck_name = filteredDeckName
+            
+            # Count cards in the filtered deck
+            card_count = collection.db.scalar(
+                "select count() from cards where did = ?", filtered_deck['id']
+            ) or 0
+            
+            collection.autosave()
+            self.stopEditing()
+            
+            return {
+                'sourceDeck': deckName,
+                'filteredDeckName': filtered_deck_name,
+                'filteredDeckId': filtered_deck['id'],
+                'days': days,
+                'cardsFound': card_count,
+                'message': f"Created filtered deck with {card_count} forgotten cards from last {days} day(s)"
+            }
+            
+        except Exception as e:
+            self.stopEditing()
+            raise e
+    
+    def createCustomStudy(self, deckName, newCardsPerDay=None, reviewsPerDay=None, 
+                         studyForgottenToday=False, extendNewLimit=None):
+        """
+        Combined API for creating a custom study session with various options.
+        
+        Args:
+            deckName (str): Name of the deck to configure
+            newCardsPerDay (int, optional): Set new cards per day limit
+            reviewsPerDay (int, optional): Set reviews per day limit
+            studyForgottenToday (bool): Create filtered deck for forgotten cards today
+            extendNewLimit (int, optional): Extend today's new card limit by this many cards
+            
+        Returns:
+            dict: Results of all requested operations
+        """
+        results = {
+            'deckName': deckName,
+            'operations': {}
+        }
+        
+        # Set deck study options if requested
+        if newCardsPerDay is not None or reviewsPerDay is not None:
+            try:
+                config_result = self.setDeckStudyOptions(
+                    deckName, newCardsPerDay, reviewsPerDay
+                )
+                results['operations']['studyOptions'] = {
+                    'success': True,
+                    'data': config_result
+                }
+            except Exception as e:
+                results['operations']['studyOptions'] = {
+                    'success': False,
+                    'error': str(e)
+                }
+        
+        # Extend new card limit if requested
+        if extendNewLimit is not None:
+            try:
+                extend_result = self.extendNewCardLimit(deckName, extendNewLimit)
+                results['operations']['extendNewLimit'] = {
+                    'success': True,
+                    'data': extend_result
+                }
+            except Exception as e:
+                results['operations']['extendNewLimit'] = {
+                    'success': False,
+                    'error': str(e)
+                }
+        
+        # Create forgotten cards filtered deck if requested
+        if studyForgottenToday:
+            try:
+                forgotten_result = self.enableStudyForgotten(deckName, days=1)
+                results['operations']['studyForgotten'] = {
+                    'success': True,
+                    'data': forgotten_result
+                }
+            except Exception as e:
+                results['operations']['studyForgotten'] = {
+                    'success': False,
+                    'error': str(e)
+                }
+        
+        return results
