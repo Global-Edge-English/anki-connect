@@ -50,7 +50,7 @@ user_config.json
 
 # Build artifacts
 *.zip
-!AnkiConnect.zip
+GlobalEdgeAnkiConnect.zip
 
 # Testing
 .pytest_cache/
@@ -66,4 +66,3 @@ htmlcov/
 Thumbs.db
 .directory
 .Trash-*
-AnkiConnect.zip

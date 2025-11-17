@@ -52,6 +52,7 @@ except ImportError:
 #
 
 API_VERSION = 5
+ADDON_VERSION = "0.0.1"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -1552,6 +1553,11 @@ class AnkiConnect:
         return API_VERSION
     
     @webApi()
+    def addonVersion(self):
+        """Get the add-on version"""
+        return ADDON_VERSION
+    
+    @webApi()
     def debugInfo(self):
         """Debug endpoint to check what methods are available"""
         import sys
@@ -1798,6 +1804,71 @@ class AnkiConnect:
             bool: True if card is flagged
         """
         return self.anki.isCardFlagged(cardId)
+
+    @webApi()
+    def setDeckStudyOptions(self, deckName, newCardsPerDay=None, reviewsPerDay=None):
+        """
+        Set study options for a deck (convenience wrapper for getDeckConfig/saveDeckConfig)
+        
+        Args:
+            deckName (str): Name of the deck to configure
+            newCardsPerDay (int, optional): Maximum new cards to study per day
+            reviewsPerDay (int, optional): Maximum review cards per day
+            
+        Returns:
+            dict: Updated configuration with the new settings
+        """
+        return StudyManager(self.anki).setDeckStudyOptions(deckName, newCardsPerDay, reviewsPerDay)
+
+    @webApi()
+    def extendNewCardLimit(self, deckName, additionalCards):
+        """
+        Extend today's new card limit for a specific deck
+        
+        Args:
+            deckName (str): Name of the deck
+            additionalCards (int): Number of additional new cards to allow today
+            
+        Returns:
+            dict: Information about the extended limit
+        """
+        return StudyManager(self.anki).extendNewCardLimit(deckName, additionalCards)
+
+    @webApi()
+    def enableStudyForgotten(self, deckName, days=1, filteredDeckName=None):
+        """
+        Create a filtered deck for studying cards that were forgotten (answered "Again") in the last X days.
+        Matches Anki's native "Review forgotten cards" custom study option.
+        
+        Args:
+            deckName (str): Name of the source deck
+            days (int): Look back this many days for forgotten cards (default: 1 = today only)
+            filteredDeckName (str, optional): Custom name for the filtered deck. If not provided, auto-generates name.
+            
+        Returns:
+            dict: Information about the created filtered deck
+        """
+        return StudyManager(self.anki).enableStudyForgotten(deckName, days, filteredDeckName)
+
+    @webApi()
+    def createCustomStudy(self, deckName, newCardsPerDay=None, reviewsPerDay=None, 
+                         studyForgottenToday=False, extendNewLimit=None):
+        """
+        Combined API for creating a custom study session with various options
+        
+        Args:
+            deckName (str): Name of the deck to configure
+            newCardsPerDay (int, optional): Set new cards per day limit
+            reviewsPerDay (int, optional): Set reviews per day limit
+            studyForgottenToday (bool): Create filtered deck for forgotten cards today
+            extendNewLimit (int, optional): Extend today's new card limit by this many cards
+            
+        Returns:
+            dict: Results of all requested operations
+        """
+        return StudyManager(self.anki).createCustomStudy(
+            deckName, newCardsPerDay, reviewsPerDay, studyForgottenToday, extendNewLimit
+        )
 
 #
 #   Entry

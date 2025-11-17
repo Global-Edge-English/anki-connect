@@ -239,10 +239,17 @@ class NoteManager:
             raise Exception(f"Deck '{deckName}' does not exist")
         
         self.startEditing()
-        collection.decks.rem(deck['id'], deleteCards)
-        self.stopEditing()
         
-        return True
+        try:
+            # Use Anki's backend remove_decks method
+            from anki.decks import DeckId
+            collection.decks.remove([DeckId(deck['id'])])
+            
+            self.stopEditing()
+            return True
+        except Exception as e:
+            self.stopEditing()
+            raise e
 
     def renameDeck(self, oldName, newName):
         """
