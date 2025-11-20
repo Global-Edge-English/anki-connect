@@ -412,7 +412,7 @@ Delete a single deck by name.
   "version": 5,
   "params": {
     "deckName": "My Custom Review Deck",
-    "deleteCards": false
+    "t
   }
 }
 ```
