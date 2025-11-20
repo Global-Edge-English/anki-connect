@@ -337,35 +337,40 @@ class NoteManager:
         if deck is None:
             return None
         
-        # Get all deck IDs for this deck and its children
-        # This includes the parent deck and all nested child decks
-        deckIds = [deck['id']]
-        for deckId, deckObj in collection.decks.decks.items():
-            # Check if this deck is a child of the specified deck
-            if deckObj['name'].startswith(deckName + '::'):
-                deckIds.append(int(deckId))
+        # Get the deck tree with counts that respect daily limits
+        # This uses the scheduler which applies all limit configurations
+        tree = collection.sched.deck_due_tree()
         
-        # Create filter for all these decks
-        deckIdsStr = ','.join(str(did) for did in deckIds)
+        # Find the specific deck node in the tree
+        deckNode = collection.decks.find_deck_in_tree(tree, deck['id'])
         
-        # Get card counts for parent deck and all child decks
-        newCount = collection.db.scalar(f"select count() from cards where did in ({deckIdsStr}) and queue = 0") or 0
-        lrnCount = collection.db.scalar(f"select count() from cards where did in ({deckIdsStr}) and queue in (1, 3)") or 0 
-        revCount = collection.db.scalar(f"select count() from cards where did in ({deckIdsStr}) and queue = 2") or 0
-        totalCount = collection.db.scalar(f"select count() from cards where did in ({deckIdsStr})") or 0
+        if deckNode is None:
+            return None
         
+        # Use the scheduler's counts which respect daily limits
+        # These match what the GUI shows
         result = {
             'id': deck['id'],
             'name': deck['name'],
-            'newCount': newCount,
-            'learningCount': lrnCount,
-            'reviewCount': revCount,
-            'totalCards': totalCount
+            'newCount': deckNode.new_count,  # Respects daily new card limit
+            'learningCount': deckNode.learn_count,
+            'reviewCount': deckNode.review_count,  # Respects daily review limit
+            'totalCards': deckNode.total_including_children  # Total cards in deck and children
         }
         
         # Add time statistics if requested
         if includeTimeStats:
             from datetime import datetime, timedelta
+            
+            # Get all deck IDs for this deck and its children for time stats
+            deckIds = [deck['id']]
+            for deckId, deckObj in collection.decks.decks.items():
+                # Check if this deck is a child of the specified deck
+                if deckObj['name'].startswith(deckName + '::'):
+                    deckIds.append(int(deckId))
+            
+            # Create filter for all these decks
+            deckIdsStr = ','.join(str(did) for did in deckIds)
             
             # Calculate timestamp based on period
             if period == "today":
