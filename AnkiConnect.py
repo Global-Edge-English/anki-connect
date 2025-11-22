@@ -27,6 +27,7 @@ import re
 import select
 import socket
 import sys
+import tempfile
 from time import time
 from unicodedata import normalize
 from operator import itemgetter
@@ -52,7 +53,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.0.2"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.0.3"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -163,6 +164,63 @@ def getMimeType(filename):
         '.pdf': 'application/pdf'
     }
     return mime_types.get(ext, 'application/octet-stream')
+
+
+def parseMultipartData(body, boundary):
+    """
+    Parse multipart/form-data request body
+    
+    Args:
+        body: Request body as bytes
+        boundary: Boundary string from Content-Type header
+        
+    Returns:
+        dict: Parsed fields and files {'fields': {name: value}, 'files': {name: (filename, data)}}
+    """
+    parts = body.split(makeBytes('--' + boundary))
+    fields = {}
+    files = {}
+    
+    for part in parts:
+        if len(part) <= 2 or part == makeBytes('--\r\n') or part == makeBytes('--'):
+            continue
+            
+        # Split headers and content
+        if makeBytes('\r\n\r\n') in part:
+            header_part, content = part.split(makeBytes('\r\n\r\n'), 1)
+        else:
+            continue
+        
+        # Remove trailing \r\n from content
+        if content.endswith(makeBytes('\r\n')):
+            content = content[:-2]
+        
+        # Parse Content-Disposition header
+        headers = header_part.split(makeBytes('\r\n'))
+        content_disposition = None
+        for header in headers:
+            if header.lower().startswith(makeBytes('content-disposition:')):
+                content_disposition = makeStr(header)
+                break
+        
+        if not content_disposition:
+            continue
+        
+        # Extract name and filename
+        name_match = re.search(r'name="([^"]+)"', content_disposition)
+        filename_match = re.search(r'filename="([^"]+)"', content_disposition)
+        
+        if name_match:
+            name = name_match.group(1)
+            if filename_match:
+                # This is a file
+                filename = filename_match.group(1)
+                files[name] = (filename, content)
+            else:
+                # This is a regular field
+                fields[name] = makeStr(content)
+    
+    return {'fields': fields, 'files': files}
 
 
 
@@ -1304,6 +1362,146 @@ class AnkiBridge:
             # Re-raise with context
             raise Exception(f"addAudioNote error: {str(e)}")
 
+    def importPackage(self, packageUrl, parentDeck=None):
+        """
+        Import an Anki package (.apkg) from a URL using the modern backend API
+        
+        Args:
+            packageUrl: URL to .apkg file
+            parentDeck: Optional parent deck name (not used in current implementation)
+        
+        Returns:
+            dict with import success status and log
+        """
+        tmp_path = None
+        try:
+            collection = self.collection()
+            if collection is None:
+                raise Exception("Collection not available")
+            
+            # Download file
+            try:
+                if sys.version_info[0] < 3:
+                    import urllib2
+                    req = urllib2.Request(packageUrl)
+                    resp = urllib2.urlopen(req, timeout=60)
+                else:
+                    from urllib import request
+                    req = request.Request(packageUrl)
+                    req.add_header('User-Agent', 'AnkiConnect')
+                    resp = request.urlopen(req, timeout=60)
+                
+                if resp.code != 200:
+                    raise Exception(f"HTTP {resp.code}: Server returned error")
+                
+                package_data = resp.read()
+                if not package_data or len(package_data) == 0:
+                    raise Exception("Downloaded data is empty")
+                
+                if not package_data.startswith(b'PK\x03\x04'):
+                    raise Exception("Downloaded data is not a valid zip/apkg file")
+                    
+            except Exception as e:
+                raise Exception(f"Download failed: {str(e)}")
+            
+            # Write to temp file
+            try:
+                with tempfile.NamedTemporaryFile(suffix='.apkg', delete=False) as tmp_file:
+                    tmp_file.write(package_data)
+                    tmp_file.flush()
+                    os.fsync(tmp_file.fileno())
+                    tmp_path = tmp_file.name
+                
+                if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                    raise Exception("Failed to create temporary file")
+                    
+            except Exception as e:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except:
+                        pass
+                raise Exception(f"Failed to write temporary file: {str(e)}")
+            
+            # Import using the modern backend API
+            try:
+                # Import the protobuf classes
+                from anki.collection import ImportAnkiPackageRequest, ImportAnkiPackageOptions
+                
+                # Get deck names before import to identify new decks
+                decks_before = set(collection.decks.allNames())
+                
+                # Create import options (with default settings similar to GUI)
+                options = ImportAnkiPackageOptions()
+                options.merge_notetypes = True  # Merge note types if they exist
+                options.with_scheduling = True   # Include scheduling information
+                options.with_deck_configs = True  # Include deck configurations
+                
+                # Create the import request
+                request = ImportAnkiPackageRequest()
+                request.package_path = tmp_path
+                request.options.CopyFrom(options)
+                
+                # Perform the import using the backend
+                result = collection.import_anki_package(request)
+                
+                # If parentDeck specified, rename imported decks to be under parent
+                if parentDeck:
+                    # Get new decks that were created by the import
+                    decks_after = set(collection.decks.allNames())
+                    new_decks = decks_after - decks_before
+                    
+                    # Rename each new deck to be under parent using Anki's rename method
+                    for deck_name in new_decks:
+                        new_name = f"{parentDeck}::{deck_name}"
+                        try:
+                            deck = collection.decks.byName(deck_name)
+                            if deck:
+                                # Use Anki's proper rename method
+                                collection.decks.rename(deck, new_name)
+                        except Exception as e:
+                            # Log but don't fail if rename fails
+                            pass
+                
+                # Build log message from result
+                log_parts = []
+                if result.log.new:
+                    log_parts.append(f"Added {len(result.log.new)} notes")
+                if result.log.updated:
+                    log_parts.append(f"Updated {len(result.log.updated)} notes")
+                if result.log.duplicate:
+                    log_parts.append(f"Skipped {len(result.log.duplicate)} duplicates")
+                
+                if parentDeck:
+                    log_parts.append(f"Imported under '{parentDeck}'")
+                
+                log = ", ".join(log_parts) if log_parts else "Import completed"
+                
+                return {
+                    'success': True,
+                    'log': log,
+                    'notes_added': len(result.log.new),
+                    'notes_updated': len(result.log.updated),
+                    'notes_duplicate': len(result.log.duplicate)
+                }
+                
+            except Exception as e:
+                # If backend import fails, provide helpful error
+                raise Exception(f"Import failed: {str(e)}")
+                    
+        except Exception as e:
+            error_msg = str(e)
+            if "Invalid file" in error_msg:
+                raise Exception("Invalid .apkg file. The file may be corrupted.")
+            else:
+                raise Exception(f"Import error: {error_msg}")
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+
 
 
 #
@@ -1691,6 +1889,20 @@ class AnkiConnect:
             Note ID on success
         """
         return self.anki.addAudioNote(note, audioFile, allowDuplicate)
+
+    @webApi()
+    def importPackage(self, packageUrl, parentDeck=None):
+        """
+        Import an Anki package (.apkg) from a URL
+        
+        Args:
+            packageUrl: URL to .apkg file (e.g., Digital Ocean Spaces URL)
+            parentDeck: Optional parent deck name to import under (preserves original deck structure)
+        
+        Returns:
+            dict with import statistics including success status, notes added/updated/duplicated, and deck name
+        """
+        return self.anki.importPackage(packageUrl, parentDeck)
 
     @webApi()
     def cardsInfo(self, cards):
