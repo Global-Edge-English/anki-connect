@@ -317,7 +317,7 @@ class NoteManager:
             'noteCount': collection.models.useCount(model)
         }
 
-    def getDeckInfo(self, deckName, includeTimeStats=True, period="allTime"):
+    def getDeckInfo(self, deckName, includeTimeStats=True, period="allTime", wantSingleDeckStats=False):
         """
         Get detailed information about a deck and its child decks
         
@@ -325,9 +325,11 @@ class NoteManager:
             deckName (str): Name of the deck
             includeTimeStats (bool): Whether to include time statistics (default: True)
             period (str): Time period for stats - "today", "last7days", "last30days", "allTime"
+            wantSingleDeckStats (bool): If True, returns only the single deck's stats (no child decks) (default: False)
             
         Returns:
-            list: Array of deck information. If deck has children, returns [parent_info, child1_info, child2_info, ...].
+            list: Array of deck information. If wantSingleDeckStats is True, returns only [parent_deck_info].
+                  Otherwise, if deck has children, returns [child1_info, child2_info, ...].
                   If deck has no children, returns [deck_info]. Each element contains stats and time stats if requested.
         """
         collection = self.collection()
@@ -412,6 +414,13 @@ class NoteManager:
                     }
             
             return deckInfo
+        
+        # If wantSingleDeckStats is True, return only the single deck (no children)
+        if wantSingleDeckStats:
+            parentInfo = getDeckStatsInfo(deck, deck['id'])
+            if parentInfo is None:
+                return None
+            return [parentInfo]
         
         # Find all child decks
         childDecks = []

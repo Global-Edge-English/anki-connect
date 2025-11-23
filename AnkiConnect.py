@@ -53,7 +53,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.0.4"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.0.5"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -1946,8 +1946,8 @@ class AnkiConnect:
         return NoteManager(self.anki).getModelInfo(modelId)
 
     @webApi()
-    def getDeckInfo(self, deckName, includeTimeStats=True, period="allTime"):
-        return NoteManager(self.anki).getDeckInfo(deckName, includeTimeStats, period)
+    def getDeckInfo(self, deckName, includeTimeStats=True, period="allTime", wantSingleDeckStats=False):
+        return NoteManager(self.anki).getDeckInfo(deckName, includeTimeStats, period, wantSingleDeckStats)
 
     @webApi()
     def deleteDeck(self, deckName, deleteCards=False):
