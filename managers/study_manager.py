@@ -755,3 +755,101 @@ class StudyManager:
                 }
         
         return results
+    
+    def getDeckReviewsByDay(self, deckName, days=14):
+        """
+        Get the number of reviews completed per day for the last N days.
+        Uses the same approach as Anki's built-in statistics calendar.
+        
+        Args:
+            deckName (str): Name of the deck (required)
+            days (int): Number of days to look back (default: 14)
+            
+        Returns:
+            dict: Daily review statistics with breakdown by card type
+        """
+        collection = self.collection()
+        if collection is None:
+            raise Exception("Collection not available")
+        
+        # Get the deck
+        deck = collection.decks.byName(deckName)
+        if deck is None:
+            raise Exception(f"Deck '{deckName}' does not exist")
+        
+        deck_id = deck['id']
+        
+        # Get all deck IDs (parent + children)
+        deck_ids = [deck_id]
+        for did, deck_obj in collection.decks.decks.items():
+            if deck_obj['name'].startswith(deckName + '::'):
+                deck_ids.append(int(did))
+        
+        deck_ids_str = ','.join(str(did) for did in deck_ids)
+        
+        # Get day cutoff from scheduler
+        day_cutoff = collection.sched.day_cutoff
+        
+        # Calculate timestamp for N days ago
+        cutoff_timestamp = (day_cutoff - (days * 86400)) * 1000
+        
+        # Query revlog using Anki's approach
+        # This matches the _done() method in stats.py
+        query = f"""
+            SELECT 
+                cast((id/1000.0 - ?) / 86400.0 as int) as day,
+                sum(case when type = 0 then 1 else 0 end) as learning,
+                sum(case when type = 1 then 1 else 0 end) as review,
+                sum(case when type = 2 then 1 else 0 end) as relearn,
+                sum(case when type = 3 then 1 else 0 end) as filtered,
+                count(*) as total
+            FROM revlog
+            WHERE id > ?
+                AND cid IN (SELECT id FROM cards WHERE did IN ({deck_ids_str}))
+            GROUP BY day
+            ORDER BY day
+        """
+        
+        results = collection.db.all(query, day_cutoff, cutoff_timestamp)
+        
+        # Process results into a more readable format
+        from datetime import datetime, timedelta
+        
+        stats = []
+        total_reviews = 0
+        
+        for row in results:
+            day_offset, learning, review, relearn, filtered, total = row
+            
+            # Calculate actual date
+            date_timestamp = day_cutoff + (day_offset * 86400)
+            date = datetime.fromtimestamp(date_timestamp).strftime('%Y-%m-%d')
+            
+            stats.append({
+                'date': date,
+                'dayNumber': day_offset,
+                'learning': learning,
+                'review': review,
+                'relearn': relearn,
+                'filtered': filtered,
+                'total': total
+            })
+            
+            total_reviews += total
+        
+        # Calculate average
+        avg_per_day = round(total_reviews / days, 1) if days > 0 else 0.0
+        
+        # Get current count of new cards available in the deck
+        new_cards_available = collection.db.scalar(
+            f"SELECT COUNT(*) FROM cards WHERE did IN ({deck_ids_str}) AND queue = 0"
+        ) or 0
+        
+        return {
+            'deckName': deckName,
+            'days': days,
+            'stats': stats,
+            'totalReviews': total_reviews,
+            'averagePerDay': avg_per_day,
+            'newCardsAvailable': new_cards_available
+        }

@@ -67,7 +67,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.0.5"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.0.6"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -1774,6 +1774,21 @@ class AnkiConnect:
         return StudyManager(self.anki).createCustomStudy(
             deckName, newCardsPerDay, reviewsPerDay, studyForgottenToday, extendNewLimit
         )
+    
+    @webApi()
+    def getDeckReviewsByDay(self, deckName, days=14):
+        """
+        Get the number of reviews completed per day for the last N days.
+        Uses the same approach as Anki's built-in statistics calendar.
+        
+        Args:
+            deckName (str): Name of the deck
+            days (int): Number of days to look back (default: 14)
+            
+        Returns:
+            dict: Daily review statistics with breakdown by card type (learning, review, relearn, filtered)
+        """
+        return StudyManager(self.anki).getDeckReviewsByDay(deckName, days)
 
 #
 #   Entry
