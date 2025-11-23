@@ -53,7 +53,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.0.3"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.0.4"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -1362,18 +1362,20 @@ class AnkiBridge:
             # Re-raise with context
             raise Exception(f"addAudioNote error: {str(e)}")
 
-    def importPackage(self, packageUrl, parentDeck=None):
+    def importPackage(self, packageUrl, parentDeck=None, allowDuplicates=False):
         """
         Import an Anki package (.apkg) from a URL using the modern backend API
         
         Args:
             packageUrl: URL to .apkg file
-            parentDeck: Optional parent deck name (not used in current implementation)
+            parentDeck: Optional parent deck name
+            allowDuplicates: If True, attempt to update duplicate notes; if False (default), skip duplicates
         
         Returns:
             dict with import success status and log
         """
         tmp_path = None
+        
         try:
             collection = self.collection()
             if collection is None:
@@ -1427,15 +1429,24 @@ class AnkiBridge:
             try:
                 # Import the protobuf classes
                 from anki.collection import ImportAnkiPackageRequest, ImportAnkiPackageOptions
+                from anki import import_export_pb2
                 
                 # Get deck names before import to identify new decks
                 decks_before = set(collection.decks.allNames())
                 
-                # Create import options (with default settings similar to GUI)
+                # Create import options
                 options = ImportAnkiPackageOptions()
                 options.merge_notetypes = True  # Merge note types if they exist
                 options.with_scheduling = True   # Include scheduling information
                 options.with_deck_configs = True  # Include deck configurations
+                
+                # Configure duplicate handling using update_notes field
+                if allowDuplicates:
+                    # ALWAYS = 1: Always update existing notes if duplicates found
+                    options.update_notes = import_export_pb2.ImportAnkiPackageUpdateCondition.IMPORT_ANKI_PACKAGE_UPDATE_CONDITION_ALWAYS
+                else:
+                    # IF_NEWER = 0: Skip duplicates (default behavior)
+                    options.update_notes = import_export_pb2.ImportAnkiPackageUpdateCondition.IMPORT_ANKI_PACKAGE_UPDATE_CONDITION_IF_NEWER
                 
                 # Create the import request
                 request = ImportAnkiPackageRequest()
@@ -1891,18 +1902,19 @@ class AnkiConnect:
         return self.anki.addAudioNote(note, audioFile, allowDuplicate)
 
     @webApi()
-    def importPackage(self, packageUrl, parentDeck=None):
+    def importPackage(self, packageUrl, parentDeck=None, allowDuplicates=False):
         """
         Import an Anki package (.apkg) from a URL
         
         Args:
             packageUrl: URL to .apkg file (e.g., Digital Ocean Spaces URL)
             parentDeck: Optional parent deck name to import under (preserves original deck structure)
+            allowDuplicates: If True, import duplicate notes; if False (default), skip duplicates
         
         Returns:
             dict with import statistics including success status, notes added/updated/duplicated, and deck name
         """
-        return self.anki.importPackage(packageUrl, parentDeck)
+        return self.anki.importPackage(packageUrl, parentDeck, allowDuplicates)
 
     @webApi()
     def cardsInfo(self, cards):
