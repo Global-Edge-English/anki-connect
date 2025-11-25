@@ -358,7 +358,8 @@ class NoteManager:
                 'newCount': deckNode.new_count,  # Respects daily new card limit
                 'learningCount': deckNode.learn_count,
                 'reviewCount': deckNode.review_count,  # Respects daily review limit
-                'totalCards': deckNode.total_including_children  # Total cards in deck and children
+                'totalCards': deckNode.total_including_children,  # Total cards in deck and children
+                'isFiltered': bool(deckObj.get('dyn', 0))  # True if this is a filtered/dynamic deck
             }
             
             # Add time statistics if requested
