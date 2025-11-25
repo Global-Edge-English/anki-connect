@@ -6,6 +6,7 @@
 
 import anki
 import anki.utils
+from ..utils.deck_helpers import get_direct_child_decks, get_deck_limits, update_parent_deck_silent
 
 class StudyManager:
     """Manages card studying and review functionality"""
@@ -436,6 +437,12 @@ class StudyManager:
         Set study options for a specific deck only (new cards per day and/or reviews per day)
         This will create a deck-specific config if the deck is currently using a shared config.
         
+        If the deck is a child deck (contains '::'), this will also automatically update the
+        parent deck's limits to be the sum of all its children's limits.
+        
+        NOTE: This method does not work with filtered (dynamic) decks, as they use a different
+        configuration system stored directly in the deck object.
+        
         Args:
             deckName (str): Name of the deck to configure
             newCardsPerDay (int, optional): Maximum new cards to study per day
@@ -452,6 +459,13 @@ class StudyManager:
         deck = collection.decks.byName(deckName)
         if deck is None:
             raise Exception(f"Deck '{deckName}' does not exist")
+        
+        # Check if this is a filtered/dynamic deck
+        # Filtered decks have 'dyn' field set to 1 and don't use standard configs
+        if deck.get('dyn', 0):
+            raise Exception(f"Cannot set study options for filtered deck '{deckName}'. "
+                          "Filtered decks use a different configuration system stored in the deck object itself. "
+                          "They do not use the standard deck configuration system.")
         
         deck_id = deck['id']
         current_config_id = deck.get('conf', 1)
@@ -505,7 +519,8 @@ class StudyManager:
             
             self.stopEditing()
             
-            return {
+            # Store result before parent update
+            result = {
                 'deckName': deckName,
                 'configId': config['id'],
                 'configName': config['name'],
@@ -514,6 +529,28 @@ class StudyManager:
                 'wasShared': len(decks_using_config) > 0,
                 'createdNewConfig': len(decks_using_config) > 0
             }
+            
+            # If this is a child deck, update parent deck's limits to be sum of all children
+            if '::' in deckName:
+                # Extract parent deck name
+                parent_name = deckName.rsplit('::', 1)[0]
+                
+                # Get all direct children of the parent
+                child_decks = get_direct_child_decks(collection, parent_name)
+                
+                # Calculate sum of all children's limits
+                total_new_cards = 0
+                total_reviews = 0
+                
+                for child_deck in child_decks:
+                    new_cards, reviews = get_deck_limits(collection, child_deck)
+                    total_new_cards += new_cards
+                    total_reviews += reviews
+                
+                # Silently update parent deck with the calculated sums
+                update_parent_deck_silent(collection, parent_name, total_new_cards, total_reviews)
+            
+            return result
             
         except Exception as e:
             self.stopEditing()

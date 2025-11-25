@@ -47,7 +47,15 @@ echo "Version updated to $NEW_VERSION in manifest.json and AnkiConnect.py"
 # Build the zip file
 rm -f GlobalEdgeAnkiConnect.zip
 cp AnkiConnect.py __init__.py
-7za a GlobalEdgeAnkiConnect.zip __init__.py manifest.json profile_manager.py note_manager.py study_manager.py
+
+# Create the zip with new folder structure
+7za a GlobalEdgeAnkiConnect.zip __init__.py manifest.json managers/ utils/
+
 rm __init__.py
 
 echo "Build complete! GlobalEdgeAnkiConnect.zip created with version $NEW_VERSION"
+echo "Package includes:"
+echo "  - AnkiConnect.py (__init__.py)"
+echo "  - manifest.json"
+echo "  - managers/ folder (note_manager.py, study_manager.py)"
+echo "  - utils/ folder (helpers.py, network.py, deck_helpers.py)"
