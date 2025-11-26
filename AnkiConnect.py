@@ -67,7 +67,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.0.6"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.0.7"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -1049,7 +1049,7 @@ class AnkiBridge:
         
         Args:
             packageUrl: URL to .apkg file
-            parentDeck: Optional parent deck name
+            parentDeck: Optional parent deck name - cards will be moved to this deck
             allowDuplicates: If True, attempt to update duplicate notes; if False (default), skip duplicates
         
         Returns:
@@ -1061,6 +1061,14 @@ class AnkiBridge:
             collection = self.collection()
             if collection is None:
                 raise Exception("Collection not available")
+            
+            # If parentDeck is specified, ensure it exists
+            if parentDeck:
+                # Create the parent deck if it doesn't exist
+                parent_deck = collection.decks.byName(parentDeck)
+                if parent_deck is None:
+                    collection.decks.id(parentDeck)  # This creates the deck
+                    parent_deck = collection.decks.byName(parentDeck)
             
             # Download file
             try:
@@ -1112,8 +1120,9 @@ class AnkiBridge:
                 from anki.collection import ImportAnkiPackageRequest, ImportAnkiPackageOptions
                 from anki import import_export_pb2
                 
-                # Get deck names before import to identify new decks
+                # Get deck names and card IDs before import to track what was imported
                 decks_before = set(collection.decks.allNames())
+                cards_before = set(collection.db.list('select id from cards'))
                 
                 # Create import options
                 options = ImportAnkiPackageOptions()
@@ -1137,23 +1146,73 @@ class AnkiBridge:
                 # Perform the import using the backend
                 result = collection.import_anki_package(request)
                 
-                # If parentDeck specified, rename imported decks to be under parent
+                # If parentDeck specified, move cards to properly named subdeck
                 if parentDeck:
-                    # Get new decks that were created by the import
-                    decks_after = set(collection.decks.allNames())
-                    new_decks = decks_after - decks_before
+                    # Extract deck name from URL as fallback
+                    # URL format: ${userId}_${uuidv4()}_${sanitizedFilename}.apkg
+                    extracted_name = None
+                    try:
+                        import urllib.parse
+                        parsed_url = urllib.parse.urlparse(packageUrl)
+                        url_filename = os.path.basename(parsed_url.path)
+                        
+                        # Remove .apkg extension
+                        if url_filename.endswith('.apkg'):
+                            url_filename = url_filename[:-5]
+                        
+                        # Split by underscore and skip first two parts (userId and uuid)
+                        parts = url_filename.split('_')
+                        if len(parts) >= 3:
+                            # Join remaining parts (in case sanitized filename has underscores)
+                            extracted_name = '_'.join(parts[2:])
+                    except:
+                        extracted_name = None
                     
-                    # Rename each new deck to be under parent using Anki's rename method
-                    for deck_name in new_decks:
-                        new_name = f"{parentDeck}::{deck_name}"
-                        try:
-                            deck = collection.decks.byName(deck_name)
-                            if deck:
-                                # Use Anki's proper rename method
-                                collection.decks.rename(deck, new_name)
-                        except Exception as e:
-                            # Log but don't fail if rename fails
-                            pass
+                    # Get new cards that were imported
+                    cards_after = set(collection.db.list('select id from cards'))
+                    new_card_ids = list(cards_after - cards_before)
+                    
+                    if new_card_ids:
+                        # Get new decks that were created by the import
+                        decks_after = set(collection.decks.allNames())
+                        new_decks = decks_after - decks_before
+                        
+                        # Determine the subdeck name
+                        subdeck_name = extracted_name if extracted_name else "imported"
+                        
+                        # If there are imported decks, check their names
+                        if new_decks:
+                            first_deck = list(new_decks)[0]
+                            # Use extracted name if deck is "Default", otherwise use the deck's name
+                            if first_deck.lower() != "default" and not extracted_name:
+                                subdeck_name = first_deck
+                            elif extracted_name:
+                                subdeck_name = extracted_name
+                            else:
+                                subdeck_name = first_deck
+                        
+                        # Create the properly named subdeck: parentDeck::subdeck_name
+                        target_deck_name = f"{parentDeck}::{subdeck_name}"
+                        
+                        # Create the deck (this will create parent hierarchy if needed)
+                        collection.decks.id(target_deck_name)
+                        
+                        # Move all imported cards to the target subdeck
+                        self.startEditing()
+                        self.changeDeck(new_card_ids, target_deck_name)
+                        self.stopEditing()
+                        
+                        # Delete the temporary imported decks (cards are already moved)
+                        for temp_deck_name in new_decks:
+                            try:
+                                temp_deck = collection.decks.byName(temp_deck_name)
+                                if temp_deck:
+                                    collection.decks.rem(temp_deck['id'], cardsToo=False)
+                            except:
+                                pass
+                        
+                        # Save all changes
+                        collection.save()
                 
                 # Build log message from result
                 log_parts = []
