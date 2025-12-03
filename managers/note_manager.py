@@ -122,23 +122,69 @@ class NoteManager:
             
             # Update fields if provided
             if fields is not None:
-                # Remove existing fields
-                for field in model['flds'][:]:
+                # Get current field names
+                existing_field_names = [f['name'] for f in model['flds']]
+                new_field_names = fields
+                
+                # Find fields to remove (in old but not in new)
+                fields_to_remove = [f for f in model['flds'] if f['name'] not in new_field_names]
+                
+                # Find fields to add (in new but not in old)
+                fields_to_add = [name for name in new_field_names if name not in existing_field_names]
+                
+                # Remove fields that are no longer needed (in reverse order to avoid index issues)
+                for field in reversed(fields_to_remove):
                     collection.models.remField(model, field)
                 
                 # Add new fields
-                for fieldName in fields:
+                for fieldName in fields_to_add:
                     field = collection.models.newField(fieldName)
                     collection.models.addField(model, field)
+                
+                # Reorder fields to match the desired order
+                # Create a mapping of field names to field objects
+                field_map = {f['name']: f for f in model['flds']}
+                
+                # Reorder the fields list to match new_field_names order
+                reordered_fields = []
+                for idx, fieldName in enumerate(new_field_names):
+                    if fieldName in field_map:
+                        field = field_map[fieldName]
+                        field['ord'] = idx  # Update the ordinal
+                        reordered_fields.append(field)
+                
+                # Replace the fields list with the reordered one
+                model['flds'] = reordered_fields
             
             # Update templates if provided
             if templates is not None:
-                # Remove existing templates
-                for template in model['tmpls'][:]:
-                    collection.models.remTemplate(model, template)
+                # Get current template names
+                existing_template_names = [t['name'] for t in model['tmpls']]
+                new_template_names = [t['name'] for t in templates]
+                
+                # Find templates to remove (in old but not in new)
+                templates_to_remove = [t for t in model['tmpls'] if t['name'] not in new_template_names]
+                
+                # Find templates to add (in new but not in old)
+                new_template_data = {t['name']: t for t in templates}
+                templates_to_add = [t for t in templates if t['name'] not in existing_template_names]
+                
+                # Update existing templates (modify qfmt/afmt for templates that exist in both)
+                for template in model['tmpls']:
+                    if template['name'] in new_template_data:
+                        template['qfmt'] = new_template_data[template['name']]['qfmt']
+                        template['afmt'] = new_template_data[template['name']]['afmt']
+                
+                # Remove templates that are no longer needed (in reverse order)
+                # Only remove if we'll still have at least 1 template after
+                if len(model['tmpls']) - len(templates_to_remove) + len(templates_to_add) >= 1:
+                    for template in reversed(templates_to_remove):
+                        collection.models.remTemplate(model, template)
+                elif len(templates_to_remove) > 0:
+                    raise Exception("Cannot remove all templates - model must have at least 1 template")
                 
                 # Add new templates
-                for templateData in templates:
+                for templateData in templates_to_add:
                     template = collection.models.newTemplate(templateData['name'])
                     template['qfmt'] = templateData['qfmt']
                     template['afmt'] = templateData['afmt']
