@@ -408,6 +408,21 @@ class NoteManager:
                 'isFiltered': bool(deckObj.get('dyn', 0))  # True if this is a filtered/dynamic deck
             }
             
+            # Add daily card limits from deck configuration
+            try:
+                config = collection.decks.confForDid(deckId)
+                if config is not None:
+                    deckInfo['newCardsPerDay'] = config.get('new', {}).get('perDay', 0)
+                    deckInfo['reviewsPerDay'] = config.get('rev', {}).get('perDay', 0)
+                else:
+                    # Config not found, use defaults
+                    deckInfo['newCardsPerDay'] = 0
+                    deckInfo['reviewsPerDay'] = 0
+            except Exception:
+                # If there's any error getting config (e.g., filtered decks), use defaults
+                deckInfo['newCardsPerDay'] = 0
+                deckInfo['reviewsPerDay'] = 0
+            
             # Add time statistics if requested
             if includeTimeStats:
                 from datetime import datetime, timedelta
