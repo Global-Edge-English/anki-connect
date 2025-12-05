@@ -67,7 +67,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.0.8"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.0.9"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
