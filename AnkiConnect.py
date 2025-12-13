@@ -67,7 +67,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.0.9"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.0.10"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -271,12 +271,19 @@ class AnkiBridge:
                     self.media().writeData(params.audio.filename, data)
 
         self.startEditing()
-        collection.addNote(note)
         
-        # Move the cards to the correct deck after note creation
-        cardIds = [card.id for card in note.cards()]
-        if cardIds and deck['id'] != collection.decks.get_current_id():
-            self.changeDeck(cardIds, params.deckName)
+        # Use modern Anki API with explicit deck_id to ensure note is created in correct deck
+        # This avoids the issue where notes would sometimes be created in the notetype's default deck
+        try:
+            # Try modern add_note() API (Anki 2.1.50+)
+            collection.add_note(note, deck['id'])
+        except (AttributeError, TypeError):
+            # Fall back to deprecated addNote() for older Anki versions
+            collection.addNote(note)
+            # Move cards to correct deck if needed (only for older versions)
+            cardIds = [card.id for card in note.cards()]
+            if cardIds:
+                self.changeDeck(cardIds, params.deckName)
         
         collection.autosave()
         self.stopEditing()
@@ -1027,12 +1034,18 @@ class AnkiBridge:
                 raise Exception(f"Duplicate note detected. First field already exists.")
             
             self.startEditing()
-            collection.addNote(note)
             
-            # Move the cards to the correct deck after note creation
-            cardIds = [card.id for card in note.cards()]
-            if cardIds and deck['id'] != collection.decks.get_current_id():
-                self.changeDeck(cardIds, deck_name)
+            # Use modern Anki API with explicit deck_id to ensure note is created in correct deck
+            try:
+                # Try modern add_note() API (Anki 2.1.50+)
+                collection.add_note(note, deck['id'])
+            except (AttributeError, TypeError):
+                # Fall back to deprecated addNote() for older Anki versions
+                collection.addNote(note)
+                # Move cards to correct deck if needed (only for older versions)
+                cardIds = [card.id for card in note.cards()]
+                if cardIds:
+                    self.changeDeck(cardIds, deck_name)
             
             collection.autosave()
             self.stopEditing()
