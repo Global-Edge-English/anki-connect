@@ -274,13 +274,13 @@ class StudyManager:
     
     def _getAnswerButtons(self, card):
         """
-        Get available answer buttons for a card
+        Get available answer buttons for a card with timing information
         
         Args:
             card: Anki card object
             
         Returns:
-            list: List of button ease values
+            list: List of button dictionaries with ease, label, and timing
         """
         collection = self.collection()
         if collection is None:
@@ -289,10 +289,46 @@ class StudyManager:
         try:
             # Get button count from scheduler
             buttonCount = collection.sched.answerButtons(card)
-            return list(range(1, buttonCount + 1))
-        except:
+            
+            # Button labels mapping
+            button_labels = {
+                1: "Again",
+                2: "Hard" if buttonCount >= 4 else "Good",
+                3: "Good" if buttonCount >= 4 else "Easy",
+                4: "Easy"
+            }
+            
+            # Try to get timing information (v3 scheduler)
+            timings = []
+            try:
+                # Get scheduling states for the card from backend
+                states = collection._backend.get_scheduling_states(card.id)
+                # Get timing labels for each button from backend
+                timing_labels = collection._backend.describe_next_states(states)
+                timings = list(timing_labels)
+            except (AttributeError, Exception):
+                # Fallback for older versions or if method not available
+                timings = [""] * buttonCount
+            
+            # Build button info with ease, label, and timing
+            buttons = []
+            for i in range(1, buttonCount + 1):
+                buttons.append({
+                    'ease': i,
+                    'label': button_labels.get(i, f"Button {i}"),
+                    'timing': timings[i - 1] if i <= len(timings) else ""
+                })
+            
+            return buttons
+            
+        except Exception as e:
             # Default buttons if scheduler method fails
-            return [1, 2, 3, 4]
+            return [
+                {'ease': 1, 'label': 'Again', 'timing': ''},
+                {'ease': 2, 'label': 'Hard', 'timing': ''},
+                {'ease': 3, 'label': 'Good', 'timing': ''},
+                {'ease': 4, 'label': 'Easy', 'timing': ''}
+            ]
     
     def getStudyStats(self, deckName=None):
         """
