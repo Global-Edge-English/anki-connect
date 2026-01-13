@@ -55,6 +55,7 @@ class StudyManager:
         # Get card information
         model = card.model()
         note = card.note()
+        template = card.template()
         
         fields = {}
         for info in model['flds']:
@@ -84,6 +85,7 @@ class StudyManager:
             'question': question,
             'answer': answer,
             'modelName': model['name'],
+            'templateName': template['name'],
             'deckName': self.bridge.deckNameFromId(card.did),
             'css': model['css'],
             'factor': card.factor,
