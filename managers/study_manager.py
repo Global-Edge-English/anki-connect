@@ -825,8 +825,11 @@ class StudyManager:
         
         deck_ids_str = ','.join(str(did) for did in deck_ids)
         
-        # Get day cutoff from scheduler
+        # Get day cutoff from scheduler (this is when "today" ENDS, typically 4am tomorrow)
         day_cutoff = collection.sched.day_cutoff
+        
+        # Calculate start of "today" in Anki's system (24 hours before day_cutoff)
+        day_start = day_cutoff - 86400
         
         # Calculate timestamp for N days ago
         cutoff_timestamp = (day_cutoff - (days * 86400)) * 1000
@@ -859,8 +862,8 @@ class StudyManager:
         for row in results:
             day_offset, learning, review, relearn, filtered, total = row
             
-            # Calculate actual date
-            date_timestamp = day_cutoff + (day_offset * 86400)
+            # Calculate actual date using day_start (not day_cutoff) to get correct calendar dates
+            date_timestamp = day_start + (day_offset * 86400)
             date = datetime.fromtimestamp(date_timestamp).strftime('%Y-%m-%d')
             
             stats.append({
