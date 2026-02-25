@@ -51,13 +51,16 @@ POST http://localhost:8765
 
 ### Parameters
 
-| Parameter     | Type    | Required | Description                               |
-| ------------- | ------- | -------- | ----------------------------------------- |
-| `id`          | integer | Yes      | Note ID to update                         |
-| `fields`      | object  | No       | Text field updates: `{fieldName: value}`  |
-| `audioFields` | object  | No       | Audio field URLs: `{fieldName: audioUrl}` |
+| Parameter     | Type    | Required | Description                                                    |
+| ------------- | ------- | -------- | -------------------------------------------------------------- |
+| `id`          | integer | Yes      | Note ID to update                                              |
+| `deckName`    | string  | Yes      | Parent deck name - validates note belongs to this deck/subdeck |
+| `fields`      | object  | No       | Text field updates: `{fieldName: value}`                       |
+| `audioFields` | object  | No       | Audio field URLs: `{fieldName: audioUrl}`                      |
 
 **Note:** At least one of `fields` or `audioFields` must be provided.
+
+**Deck Validation:** The `deckName` parameter is **required** and validates that at least one card from the note belongs to the specified deck or any of its subdecks (case-sensitive matching).
 
 ## Usage Examples
 
@@ -70,6 +73,7 @@ POST http://localhost:8765
   "params": {
     "note": {
       "id": 1234567890,
+      "deckName": "MyDeck",
       "fields": {
         "Front": "Updated front text",
         "Back": "Updated back text",
@@ -108,6 +112,7 @@ POST http://localhost:8765
   "params": {
     "note": {
       "id": 1234567890,
+      "deckName": "local_67769a9c-6770-44ec-8c88-81190f6e78bd",
       "audioFields": {
         "Audio": "https://example.com/audio/pronunciation.mp3"
       }
@@ -143,6 +148,7 @@ POST http://localhost:8765
   "params": {
     "note": {
       "id": 1234567890,
+      "deckName": "VocabularyDeck",
       "fields": {
         "Front": "New vocabulary word",
         "Back": "Definition here"
@@ -334,7 +340,12 @@ The following card data is **automatically preserved**:
 ### JavaScript/Node.js
 
 ```javascript
-async function updateNoteFields(noteId, textFields, audioFields = {}) {
+async function updateNoteFields(
+  noteId,
+  deckName,
+  textFields,
+  audioFields = {},
+) {
   const response = await fetch("http://localhost:8765", {
     method: "POST",
     body: JSON.stringify({
@@ -343,6 +354,7 @@ async function updateNoteFields(noteId, textFields, audioFields = {}) {
       params: {
         note: {
           id: noteId,
+          deckName: deckName,
           fields: textFields,
           audioFields: audioFields,
         },
@@ -360,6 +372,7 @@ async function updateNoteFields(noteId, textFields, audioFields = {}) {
 // Usage
 await updateNoteFields(
   1234567890,
+  "MyDeck",
   { Front: "Hello", Back: "World" },
   { Audio: "https://example.com/audio.mp3" },
 );
@@ -370,13 +383,14 @@ await updateNoteFields(
 ```python
 import requests
 
-def update_note_fields(note_id, text_fields=None, audio_fields=None):
+def update_note_fields(note_id, deck_name, text_fields=None, audio_fields=None):
     payload = {
         "action": "updateNoteFields",
         "version": 6,
         "params": {
             "note": {
                 "id": note_id,
+                "deckName": deck_name,
                 "fields": text_fields or {},
                 "audioFields": audio_fields or {}
             }
@@ -394,6 +408,7 @@ def update_note_fields(note_id, text_fields=None, audio_fields=None):
 # Usage
 update_note_fields(
     1234567890,
+    deck_name='MyDeck',
     text_fields={'Front': 'Hello', 'Back': 'World'},
     audio_fields={'Audio': 'https://example.com/audio.mp3'}
 )

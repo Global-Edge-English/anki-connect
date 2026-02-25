@@ -321,11 +321,12 @@ class AnkiBridge:
 
     def updateNoteFields(self, params):
         """
-        Update note fields with optional audio download
+        Update note fields with optional audio download and deck validation
         
         Args:
             params (dict): {
                 'id': noteId (required),
+                'deckName': parent deck name (required),
                 'fields': {fieldName: value, ...} (optional - text fields),
                 'audioFields': {fieldName: audioUrl, ...} (optional - audio from URLs)
             }
@@ -337,14 +338,43 @@ class AnkiBridge:
         if collection is None:
             raise Exception("Collection not available")
         
+        # Validate deck name is provided and not empty
+        deck_name = params.get('deckName')
+        if deck_name is None:
+            raise Exception("Deck name is required")
+        if not deck_name or deck_name.strip() == '':
+            raise Exception("Deck name cannot be empty")
+        
+        # Validate note ID
         note_id = params.get('id')
         if note_id is None:
             raise Exception("Note ID is required")
         
+        # Get the note
         try:
             note = collection.getNote(note_id)
         except Exception as e:
             raise Exception(f"Failed to get note with ID {note_id}: {str(e)}")
+        
+        # Validate that at least ONE card belongs to the specified deck or subdeck
+        cards = note.cards()
+        if not cards:
+            raise Exception(f"Note {note_id} has no cards")
+        
+        has_match = False
+        
+        for card in cards:
+            card_deck_name = collection.decks.get(card.did)['name']
+            
+            # Case-sensitive check: exact match or subdeck
+            if card_deck_name == deck_name or card_deck_name.startswith(deck_name + '::'):
+                has_match = True
+                break  # Found a match, exit immediately
+        
+        if not has_match:
+            raise Exception(
+                f"Note {note_id} does not belong to deck '{deck_name}' or its subdecks"
+            )
         
         # Update text fields
         fields = params.get('fields', {})
@@ -1520,11 +1550,12 @@ class AnkiConnect:
     @webApi()
     def updateNoteFields(self, note):
         """
-        Update note fields with optional audio download (unified API)
+        Update note fields with optional audio download and deck validation (unified API)
         
         Args:
             note (dict): {
                 'id': noteId (required),
+                'deckName': parent deck name (required) - validates note belongs to this deck,
                 'fields': {fieldName: value, ...} (optional - text fields),
                 'audioFields': {fieldName: audioUrl, ...} (optional - audio from URLs)
             }
@@ -1536,27 +1567,32 @@ class AnkiConnect:
             # Update text fields only
             updateNoteFields({
                 'id': 1234567890,
+                'deckName': 'local_67769a9c-6770-44ec-8c88-81190f6e78bd',
                 'fields': {'Front': 'New text', 'Back': 'Updated'}
             })
             
             # Update audio field only
             updateNoteFields({
                 'id': 1234567890,
+                'deckName': 'MyDeck',
                 'audioFields': {'Audio': 'https://example.com/audio.mp3'}
             })
             
             # Update both text and audio
             updateNoteFields({
                 'id': 1234567890,
+                'deckName': 'MyDeck',
                 'fields': {'Front': 'New text'},
                 'audioFields': {'Audio': 'https://example.com/audio.mp3'}
             })
             
         Note:
+            - deckName is REQUIRED - validates at least one card belongs to deck or subdeck
             - Card timing data (intervals, ease, due dates) is automatically preserved
             - Audio replaces the entire field content with [sound:filename.mp3]
             - All cards from the same note are updated with new field values
             - Creates an undo entry in Anki
+            - Case-sensitive deck matching
         """
         return self.anki.updateNoteFields(note)
 
