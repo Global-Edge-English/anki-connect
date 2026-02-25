@@ -67,7 +67,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.1.1"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.1.2"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -320,17 +320,101 @@ class AnkiBridge:
         return note
 
     def updateNoteFields(self, params):
+        """
+        Update note fields with optional audio download
+        
+        Args:
+            params (dict): {
+                'id': noteId (required),
+                'fields': {fieldName: value, ...} (optional - text fields),
+                'audioFields': {fieldName: audioUrl, ...} (optional - audio from URLs)
+            }
+            
+        Returns:
+            dict: Updated note information
+        """
         collection = self.collection()
         if collection is None:
-            return
-
-        note = collection.getNote(params['id'])
-        if note is None:
-            raise Exception("Failed to get note:{}".format(params['id']))
-        for name, value in params['fields'].items():
+            raise Exception("Collection not available")
+        
+        note_id = params.get('id')
+        if note_id is None:
+            raise Exception("Note ID is required")
+        
+        try:
+            note = collection.getNote(note_id)
+        except Exception as e:
+            raise Exception(f"Failed to get note with ID {note_id}: {str(e)}")
+        
+        # Update text fields
+        fields = params.get('fields', {})
+        for name, value in fields.items():
             if name in note:
                 note[name] = value
-        note.flush()
+            else:
+                raise Exception(f"Field '{name}' not found in note type '{note.note_type()['name']}'")
+        
+        # Update audio fields
+        audio_fields = params.get('audioFields', {})
+        for field_name, audio_url in audio_fields.items():
+            if field_name not in note:
+                raise Exception(f"Field '{field_name}' not found in note type '{note.note_type()['name']}'")
+            
+            if not audio_url or not verifyString(audio_url):
+                raise Exception(f"Invalid audio URL for field '{field_name}'")
+            
+            try:
+                # Download audio file from URL
+                audio_data = download(audio_url)
+                if audio_data is None or len(audio_data) == 0:
+                    raise Exception(f"Failed to download audio from URL: {audio_url}")
+                
+                # Generate unique filename from URL
+                import urllib.parse
+                parsed_url = urllib.parse.urlparse(audio_url)
+                url_filename = os.path.basename(parsed_url.path)
+                
+                if url_filename and '.' in url_filename:
+                    # Use filename from URL with unique timestamp
+                    timestamp = int(time())
+                    name, ext = os.path.splitext(url_filename)
+                    audio_filename = f"{name}_{timestamp}{ext}"
+                else:
+                    # Generate completely new filename
+                    timestamp = int(time())
+                    url_hash = hashlib.md5(audio_url.encode('utf-8')).hexdigest()[:8]
+                    audio_filename = f"audio_{timestamp}_{url_hash}.mp3"
+                
+                # Ensure filename has no directory components
+                audio_filename = os.path.basename(audio_filename)
+                
+                # Store audio file in media folder
+                self.media().writeData(audio_filename, audio_data)
+                
+                # Replace field content with audio reference
+                note[field_name] = f'[sound:{audio_filename}]'
+                
+            except Exception as e:
+                raise Exception(f"Failed to process audio for field '{field_name}': {str(e)}")
+        
+        # Validate that at least one field was provided
+        if not fields and not audio_fields:
+            raise Exception("No fields or audioFields provided to update")
+        
+        # Save note using modern API (creates undo entry)
+        self.startEditing()
+        collection.update_note(note)
+        collection.autosave()
+        self.stopEditing()
+        
+        # Return updated note information
+        return {
+            'noteId': note.id,
+            'fields': {name: note[name] for name in note.keys()},
+            'tags': note.tags,
+            'modelName': note.note_type()['name'],
+            'cards': [card.id for card in note.cards()]
+        }
 
     def addTags(self, notes, tags, add=True):
         self.startEditing()
@@ -1435,6 +1519,45 @@ class AnkiConnect:
 
     @webApi()
     def updateNoteFields(self, note):
+        """
+        Update note fields with optional audio download (unified API)
+        
+        Args:
+            note (dict): {
+                'id': noteId (required),
+                'fields': {fieldName: value, ...} (optional - text fields),
+                'audioFields': {fieldName: audioUrl, ...} (optional - audio from URLs)
+            }
+            
+        Returns:
+            dict: Updated note information including noteId, fields, tags, modelName, and card IDs
+            
+        Examples:
+            # Update text fields only
+            updateNoteFields({
+                'id': 1234567890,
+                'fields': {'Front': 'New text', 'Back': 'Updated'}
+            })
+            
+            # Update audio field only
+            updateNoteFields({
+                'id': 1234567890,
+                'audioFields': {'Audio': 'https://example.com/audio.mp3'}
+            })
+            
+            # Update both text and audio
+            updateNoteFields({
+                'id': 1234567890,
+                'fields': {'Front': 'New text'},
+                'audioFields': {'Audio': 'https://example.com/audio.mp3'}
+            })
+            
+        Note:
+            - Card timing data (intervals, ease, due dates) is automatically preserved
+            - Audio replaces the entire field content with [sound:filename.mp3]
+            - All cards from the same note are updated with new field values
+            - Creates an undo entry in Anki
+        """
         return self.anki.updateNoteFields(note)
 
     @webApi()
