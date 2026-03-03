@@ -794,20 +794,24 @@ class StudyManager:
         
         return results
     
-    def undoAnswerCard(self, cardId):
+    def undoAnswerCard(self, cardId, deckName):
         """
         Undo the most recent answer for a specific card by card ID.
 
         This works by:
-        1. Finding the most recent revlog entry for the card
-        2. Reading the pre-answer state from that entry (lastIvl, prior factor)
-        3. Deleting the revlog entry
-        4. Restoring the card's scheduling state to what it was before the answer
+        1. Optionally validating the card belongs to deckName (or a subdeck)
+        2. Finding the most recent revlog entry for the card
+        3. Reading the pre-answer state from that entry (lastIvl, prior factor)
+        4. Deleting the revlog entry
+        5. Restoring the card's scheduling state to what it was before the answer
 
         After undo, the card will be immediately available in the review queue.
 
         Args:
             cardId (int): ID of the card whose most recent answer should be undone
+            deckName (str, optional): Parent deck name. If provided, the card must
+                                      belong to this deck or one of its subdecks,
+                                      otherwise the undo is rejected.
 
         Returns:
             dict: {
@@ -817,7 +821,7 @@ class StudyManager:
             }
 
         Raises:
-            Exception: If no answer history found for the card, or card doesn't exist
+            Exception: If card doesn't exist, card not in deck, or no answer history
         """
         collection = self.collection()
         if collection is None:
@@ -831,6 +835,20 @@ class StudyManager:
             card = collection.getCard(cardId)
         except Exception:
             raise Exception(f"Card with ID '{cardId}' does not exist")
+
+        # If deckName provided, validate the card belongs to that deck or a subdeck
+        if deckName:
+            # Verify the parent deck exists
+            parent_deck = collection.decks.byName(deckName)
+            if parent_deck is None:
+                raise Exception(f"Deck '{deckName}' does not exist")
+
+            card_deck_name = collection.decks.get(card.did)['name']
+            if card_deck_name != deckName and not card_deck_name.startswith(deckName + '::'):
+                raise Exception(
+                    f"Card '{cardId}' does not belong to deck '{deckName}' or its subdecks "
+                    f"(card is in '{card_deck_name}')"
+                )
 
         # Find the most recent revlog entry for this card
         revlog_entry = collection.db.first(

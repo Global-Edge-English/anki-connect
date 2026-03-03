@@ -2036,20 +2036,23 @@ class AnkiConnect:
         return NoteManager(self.anki).getNoteIds(deckName, page, pageSize, query)
 
     @webApi()
-    def deleteNote(self, noteId):
+    def deleteNote(self, noteId, deckName):
         """
         Delete a note and all its cards by note ID.
 
         Args:
             noteId (int): ID of the note to delete
+            deckName (str): Parent deck name. At least one card of the note must
+                            belong to this deck or one of its subdecks — the
+                            request is rejected otherwise.
 
         Returns:
             bool: True if successful
         """
-        return NoteManager(self.anki).deleteNote(noteId)
+        return NoteManager(self.anki).deleteNote(noteId, deckName)
 
     @webApi()
-    def undoAnswerCard(self, cardId):
+    def undoAnswerCard(self, cardId, deckName):
         """
         Undo the most recent answer for a specific card.
 
@@ -2059,6 +2062,8 @@ class AnkiConnect:
 
         Args:
             cardId (int): ID of the card whose most recent answer should be undone
+            deckName (str): Parent deck name. The card must belong to this deck or
+                            one of its subdecks — the request is rejected otherwise.
 
         Returns:
             dict: {
@@ -2067,7 +2072,7 @@ class AnkiConnect:
                 'restoredInterval': int  # interval the card had before the answer
             }
         """
-        return StudyManager(self.anki).undoAnswerCard(cardId)
+        return StudyManager(self.anki).undoAnswerCard(cardId, deckName)
 
     @webApi()
     def getDeckReviewsByDay(self, deckName, days=14):

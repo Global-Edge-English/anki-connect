@@ -409,18 +409,21 @@ class NoteManager:
             'query': final_query
         }
 
-    def deleteNote(self, noteId):
+    def deleteNote(self, noteId, deckName):
         """
         Delete a note (and all its cards) by note ID.
 
         Args:
             noteId (int): ID of the note to delete
+            deckName (str): Parent deck name. At least one card of the note must
+                            belong to this deck or one of its subdecks — the
+                            request is rejected otherwise.
 
         Returns:
             bool: True if successful
 
         Raises:
-            Exception: If the note does not exist or deletion fails
+            Exception: If the note does not exist, is not in the deck, or deletion fails
         """
         collection = self.collection()
         if collection is None:
@@ -428,6 +431,14 @@ class NoteManager:
 
         if noteId is None:
             raise Exception("noteId is required")
+
+        if not deckName:
+            raise Exception("deckName is required")
+
+        # Verify deck exists
+        parent_deck = collection.decks.byName(deckName)
+        if parent_deck is None:
+            raise Exception(f"Deck '{deckName}' does not exist")
 
         # Verify note exists
         try:
@@ -437,6 +448,23 @@ class NoteManager:
                 note = collection.getNote(noteId)
             except Exception:
                 raise Exception(f"Note with ID '{noteId}' does not exist")
+
+        # Validate at least one card belongs to deckName or a subdeck
+        cards = note.cards()
+        if not cards:
+            raise Exception(f"Note '{noteId}' has no cards")
+
+        has_match = any(
+            collection.decks.get(card.did)['name'] == deckName or
+            collection.decks.get(card.did)['name'].startswith(deckName + '::')
+            for card in cards
+        )
+        if not has_match:
+            card_deck = collection.decks.get(cards[0].did)['name']
+            raise Exception(
+                f"Note '{noteId}' does not belong to deck '{deckName}' or its subdecks "
+                f"(note is in '{card_deck}')"
+            )
 
         self.startEditing()
         try:
