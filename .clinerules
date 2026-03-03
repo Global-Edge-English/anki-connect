@@ -1,0 +1,114 @@
+d some rul# Cline Rules - AnkiConnect Global Edge Project
+
+## Meta Instructions
+
+**Maintaining This File:**
+
+- This file should be treated as a living document that evolves with the project
+- When the user provides corrections, clarifications, or additional context about the codebase during any task, update this file to capture that knowledge
+- Add new sections or expand existing ones based on learnings from working on the project
+- The goal is to build up institutional knowledge that persists across all tasks
+
+## Project Context
+
+This is a fork of the AnkiConnect plugin for Anki. AnkiConnect provides a RESTful API that enables external applications to communicate with Anki over a network interface (default port 8765).
+
+## Related Codebases
+
+- **Anki source code location**: `../anki`
+  - When investigating Anki-specific functionality, APIs, or implementation details, refer to the Anki source code
+  - Useful for understanding internal Anki methods, data structures, and behavior
+
+## Development Guidelines
+
+### API Compatibility
+
+- Maintain backward compatibility with API version 5
+- All API responses should follow the format: `{"result": <data>, "error": <error_message>}`
+- New features should be thoroughly documented
+
+### Code Organization
+
+- **Main plugin file**: `AnkiConnect.py` - Contains the HTTP server and API endpoint handlers
+- **Managers**: `managers/` - Modular components for specific functionality (note management, study management)
+- **Utilities**: `utils/` - Helper functions and shared utilities
+- **Documentation**: `docs/` - Feature documentation and implementation notes
+- **Tests**: `tests/` - Test suite with Docker-based testing for different Anki versions
+
+### Testing
+
+- Test changes against both Anki 2.0.x and 2.1.x when possible
+- Docker test environments are available in `tests/docker/`
+- Run tests before committing significant changes
+
+### Documentation
+
+- Document new API endpoints or features in the `docs/` directory
+- Follow the existing documentation format with:
+  - Clear descriptions
+  - Sample requests (JSON)
+  - Sample responses (JSON)
+  - Implementation notes and considerations
+
+### Anki Version Compatibility
+
+- Support both Anki 2.0.x and 2.1.x
+- Be aware of API differences between versions
+- Check Anki source code in `../anki` when dealing with version-specific behavior
+
+## Common Tasks
+
+### Adding New API Endpoints
+
+1. Add the handler method to the appropriate manager class or `AnkiConnect.py`
+2. Register the action in the request handler
+3. Document the endpoint in `docs/`
+4. Add tests if applicable
+
+### Investigating Anki Behavior
+
+**MANDATORY: Always Check Anki Source Code First**
+
+- **BEFORE implementing ANY feature** that interacts with Anki's collection, notes, cards, decks, or models:
+  - **MUST** check the Anki source code in `../anki/pylib/anki/`
+  - **MUST** review relevant files: `collection.py`, `notes.py`, `cards.py`, `models.py`, `decks.py`
+  - **MUST** verify current API methods and signatures
+  - **MUST** check for modern vs deprecated APIs
+- **DO NOT trust AnkiConnect patterns alone** - they may be outdated
+- Anki source code is the source of truth for:
+  - Current method names and signatures
+  - Data structures and field access patterns
+  - Version-specific differences (2.0.x vs 2.1.x)
+  - Deprecated methods and their replacements
+- Document any version-specific differences or API changes found
+- When in doubt, search the Anki codebase for usage examples
+
+### Debugging
+
+- The HTTP server runs on port 8765
+- Check Anki's debug console for error messages
+- Test API calls using curl or browser tools
+
+## Key Learnings
+
+### Anki API Patterns (Updated from Source)
+
+**Note Access:**
+
+- Modern: `collection.get_note(note_id)` returns Note object
+- Legacy: `collection.getNote(note_id)` (deprecated but may work)
+- Note dict-like interface: `note.keys()`, `note.values()`, `note.items()`
+- Field access: `note[field_name]` or `note.fields[index]`
+- Notetype: `note.note_type()` (replaces deprecated `note.model()`)
+
+**Field Mapping:**
+
+- Note has internal `_fmap` that maps field names to `(order, field_info)` tuples
+- Access via `note._fmap[field_name][0]` for field order
+- Or iterate: `for ord, field_info in note._fmap.values()`
+
+**Version Compatibility:**
+
+- Always handle both modern and legacy API patterns
+- Use try/except blocks for version-specific code
+- Test against both Anki 2.0.x and 2.1.x when possible

@@ -2007,6 +2007,69 @@ class AnkiConnect:
         )
     
     @webApi()
+    def getNoteIds(self, deckName=None, page=1, pageSize=50, query=None):
+        """
+        Get a paginated list of note IDs using an optional deck name and/or search query.
+
+        Supports the same search syntax as Anki's card browser (e.g. "flag:1", "is:due",
+        "tag:mytag", "front:hello", "added:7", etc.).
+
+        At least one of 'deckName' or 'query' must be provided.
+
+        Args:
+            deckName (str, optional): Name of the parent deck (subdecks automatically included)
+            page (int): 1-indexed page number (default: 1)
+            pageSize (int): Number of note IDs per page (default: 50)
+            query (str, optional): Anki search query string — same syntax as the card browser.
+                                   If both deckName and query are given, they are ANDed together.
+
+        Returns:
+            dict: {
+                'noteIds': list of note IDs for the requested page,
+                'page': current page number,
+                'pageSize': page size used,
+                'total': total number of matching notes,
+                'totalPages': total number of pages,
+                'query': the final query string that was executed
+            }
+        """
+        return NoteManager(self.anki).getNoteIds(deckName, page, pageSize, query)
+
+    @webApi()
+    def deleteNote(self, noteId):
+        """
+        Delete a note and all its cards by note ID.
+
+        Args:
+            noteId (int): ID of the note to delete
+
+        Returns:
+            bool: True if successful
+        """
+        return NoteManager(self.anki).deleteNote(noteId)
+
+    @webApi()
+    def undoAnswerCard(self, cardId):
+        """
+        Undo the most recent answer for a specific card.
+
+        Deletes the most recent revlog entry for the card and restores the card's
+        scheduling state to what it was before that answer. The card will be
+        immediately available in the review queue after undo.
+
+        Args:
+            cardId (int): ID of the card whose most recent answer should be undone
+
+        Returns:
+            dict: {
+                'cardId': int,
+                'restoredState': str,    # 'new', 'learning', or 'review'
+                'restoredInterval': int  # interval the card had before the answer
+            }
+        """
+        return StudyManager(self.anki).undoAnswerCard(cardId)
+
+    @webApi()
     def getDeckReviewsByDay(self, deckName, days=14):
         """
         Get the number of reviews completed per day for the last N days.

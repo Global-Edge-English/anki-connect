@@ -327,6 +327,134 @@ class NoteManager:
         
         return True
 
+    # Note Retrieval & Deletion
+
+    def getNoteIds(self, deckName=None, page=1, pageSize=50, query=None):
+        """
+        Get a paginated list of note IDs using an optional deck name and/or search query.
+
+        Supports the same search syntax as Anki's card browser (e.g. "flag:1", "is:due",
+        "tag:mytag", "front:hello", "added:7", etc.).
+
+        Args:
+            deckName (str, optional): Name of the parent deck (subdecks are automatically
+                                      included). If omitted, searches across all decks.
+            page (int): 1-indexed page number (default: 1)
+            pageSize (int): Number of note IDs per page (default: 50)
+            query (str, optional): Additional Anki search query string. Combined with
+                                   deckName filter using AND if both are provided.
+
+        Returns:
+            dict: { noteIds, page, pageSize, total, totalPages, query }
+
+        Examples:
+            # All notes in a deck (including subdecks)
+            getNoteIds(deckName="MyDeck")
+
+            # Notes in a deck matching a search filter
+            getNoteIds(deckName="MyDeck", query="is:due")
+
+            # Search across all decks with a query (no deckName)
+            getNoteIds(query="tag:important flag:1")
+
+            # Free-form search just like the card browser
+            getNoteIds(query="front:hello added:7")
+        """
+        collection = self.collection()
+        if collection is None:
+            raise Exception("Collection not available")
+
+        if page < 1:
+            raise Exception("page must be >= 1")
+        if pageSize < 1:
+            raise Exception("pageSize must be >= 1")
+
+        # Build the final search query
+        parts = []
+
+        if deckName:
+            # Verify deck exists
+            deck = collection.decks.byName(deckName)
+            if deck is None:
+                raise Exception(f"Deck '{deckName}' does not exist")
+            # deck:"name" automatically includes all subdecks in Anki
+            parts.append(f"deck:\"{deckName}\"")
+
+        if query and query.strip():
+            parts.append(query.strip())
+
+        if not parts:
+            raise Exception("At least one of 'deckName' or 'query' must be provided")
+
+        final_query = " ".join(parts)
+
+        try:
+            all_note_ids = list(collection.find_notes(final_query))
+        except Exception as e:
+            raise Exception(f"Invalid search query '{final_query}': {str(e)}")
+
+        total = len(all_note_ids)
+        total_pages = max(1, (total + pageSize - 1) // pageSize)
+
+        start = (page - 1) * pageSize
+        end = start + pageSize
+        page_note_ids = all_note_ids[start:end]
+
+        return {
+            'noteIds': page_note_ids,
+            'page': page,
+            'pageSize': pageSize,
+            'total': total,
+            'totalPages': total_pages,
+            'query': final_query
+        }
+
+    def deleteNote(self, noteId):
+        """
+        Delete a note (and all its cards) by note ID.
+
+        Args:
+            noteId (int): ID of the note to delete
+
+        Returns:
+            bool: True if successful
+
+        Raises:
+            Exception: If the note does not exist or deletion fails
+        """
+        collection = self.collection()
+        if collection is None:
+            raise Exception("Collection not available")
+
+        if noteId is None:
+            raise Exception("noteId is required")
+
+        # Verify note exists
+        try:
+            note = collection.get_note(noteId)
+        except Exception:
+            try:
+                note = collection.getNote(noteId)
+            except Exception:
+                raise Exception(f"Note with ID '{noteId}' does not exist")
+
+        self.startEditing()
+        try:
+            # Use modern remove_notes API (Anki 2.1.x)
+            try:
+                from anki.notes import NoteId
+                collection.remove_notes([NoteId(noteId)])
+            except (ImportError, AttributeError, TypeError):
+                # Fallback for older Anki versions
+                collection.remNotes([noteId])
+
+            collection.autosave()
+            self.stopEditing()
+            return True
+        except Exception as e:
+            self.stopEditing()
+            raise e
+
     # Utility Methods
     
     def getModelInfo(self, modelId):
