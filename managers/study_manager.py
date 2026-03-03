@@ -794,6 +794,172 @@ class StudyManager:
         
         return results
     
+    def undoAnswerCard(self, cardId, deckName):
+        """
+        Undo the most recent answer for a specific card by card ID.
+
+        This works by:
+        1. Optionally validating the card belongs to deckName (or a subdeck)
+        2. Finding the most recent revlog entry for the card
+        3. Reading the pre-answer state from that entry (lastIvl, prior factor)
+        4. Deleting the revlog entry
+        5. Restoring the card's scheduling state to what it was before the answer
+
+        After undo, the card will be immediately available in the review queue.
+
+        Args:
+            cardId (int): ID of the card whose most recent answer should be undone
+            deckName (str, optional): Parent deck name. If provided, the card must
+                                      belong to this deck or one of its subdecks,
+                                      otherwise the undo is rejected.
+
+        Returns:
+            dict: {
+                'cardId': int,
+                'restoredState': str,   # 'new', 'learning', or 'review'
+                'restoredInterval': int  # interval before the answer
+            }
+
+        Raises:
+            Exception: If card doesn't exist, card not in deck, or no answer history
+        """
+        collection = self.collection()
+        if collection is None:
+            raise Exception("Collection not available")
+
+        if cardId is None:
+            raise Exception("cardId is required")
+
+        # Verify card exists
+        try:
+            card = collection.getCard(cardId)
+        except Exception:
+            raise Exception(f"Card with ID '{cardId}' does not exist")
+
+        # If deckName provided, validate the card belongs to that deck or a subdeck
+        if deckName:
+            # Verify the parent deck exists
+            parent_deck = collection.decks.byName(deckName)
+            if parent_deck is None:
+                raise Exception(f"Deck '{deckName}' does not exist")
+
+            card_deck_name = collection.decks.get(card.did)['name']
+            if card_deck_name != deckName and not card_deck_name.startswith(deckName + '::'):
+                raise Exception(
+                    f"Card '{cardId}' does not belong to deck '{deckName}' or its subdecks "
+                    f"(card is in '{card_deck_name}')"
+                )
+
+        # Find the most recent revlog entry for this card
+        revlog_entry = collection.db.first(
+            "SELECT id, ease, ivl, lastIvl, factor, time, type "
+            "FROM revlog WHERE cid = ? ORDER BY id DESC LIMIT 1",
+            cardId
+        )
+
+        if revlog_entry is None:
+            raise Exception(f"No answer history found for card '{cardId}'")
+
+        revlog_id, ease, ivl, last_ivl, factor, time_taken, review_type = revlog_entry
+
+        # Get the prior factor from the second-most-recent revlog entry (if any)
+        prior_entry = collection.db.first(
+            "SELECT factor FROM revlog WHERE cid = ? ORDER BY id DESC LIMIT 1 OFFSET 1",
+            cardId
+        )
+        prior_factor = prior_entry[0] if prior_entry and prior_entry[0] else 2500
+
+        # Delete the most recent revlog entry to erase this answer from history
+        collection.db.execute("DELETE FROM revlog WHERE id = ?", revlog_id)
+
+        # Restore card state based on the interval before the answer (last_ivl):
+        #   last_ivl == 0  → card was new before this answer
+        #   last_ivl < 0   → card was in a learning step (value = negative seconds for next step)
+        #   last_ivl > 0   → card was a mature review card (value = days)
+
+        self.startEditing()
+        try:
+            import time as time_module
+
+            # ----------------------------------------------------------------
+            # Decrement the deck's "shown today" counter for the card type
+            # that was active BEFORE the answer. This is the same per-deck
+            # counter that Anki's native undo adjusts (stored as
+            # deck['newToday'] / deck['lrnToday'] / deck['revToday'], each a
+            # [day_number, count] tuple). Without this, the daily budget stays
+            # short by 1 even after the revlog entry is removed.
+            # ----------------------------------------------------------------
+            today = collection.sched.today
+            deck = collection.decks.get(card.did)
+            if deck:
+                if last_ivl == 0:
+                    today_field = 'newToday'
+                elif last_ivl < 0:
+                    today_field = 'lrnToday'
+                else:
+                    today_field = 'revToday'
+
+                today_entry = deck.get(today_field)
+                if today_entry and today_entry[0] == today and today_entry[1] > 0:
+                    deck[today_field][1] -= 1
+                    collection.decks.save(deck)
+
+            # ----------------------------------------------------------------
+            # Restore the card's scheduling state
+            # ----------------------------------------------------------------
+            if last_ivl == 0:
+                # Card was NEW before this answer.
+                # forgetCards() resets to queue=0 via Anki's proper pipeline.
+                collection.sched.forgetCards([cardId])
+
+                # forgetCards() assigns due = card.ord (its position number),
+                # which buries it deep in the new queue. Re-fetch and set due=0
+                # to put it at the FRONT of the new queue so it shows up next.
+                card = collection.getCard(cardId)
+                card.due = 0
+                card.flush()
+                restored_state = 'new'
+
+            elif last_ivl < 0:
+                # Card was in a LEARNING step — restore to learning queue.
+                # due for learning cards is a unix timestamp in seconds;
+                # setting it to now makes the card available immediately.
+                card.type = 1
+                card.queue = 1
+                card.ivl = 0
+                card.due = int(time_module.time())
+                card.factor = prior_factor
+                card.flush()
+                restored_state = 'learning'
+
+            else:
+                # Card was a mature REVIEW card — restore to review queue.
+                # due=today makes it appear immediately in today's review pile.
+                card.type = 2
+                card.queue = 2
+                card.ivl = last_ivl
+                card.due = today
+                card.factor = prior_factor
+                card.flush()
+                restored_state = 'review'
+
+            # Force the scheduler to recount new/learn/review from the
+            # database. Without this the in-memory counts stay stale.
+            collection.sched.reset()
+
+            collection.autosave()
+            self.stopEditing()
+
+            return {
+                'cardId': cardId,
+                'restoredState': restored_state,
+                'restoredInterval': last_ivl
+            }
+
+        except Exception as e:
+            self.stopEditing()
+            raise e
+
     def getDeckReviewsByDay(self, deckName, days=14):
         """
         Get the number of reviews completed per day for the last N days.

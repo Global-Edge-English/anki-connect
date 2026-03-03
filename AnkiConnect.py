@@ -67,7 +67,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.1.1"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.1.2"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -320,17 +320,131 @@ class AnkiBridge:
         return note
 
     def updateNoteFields(self, params):
+        """
+        Update note fields with optional audio download and deck validation
+        
+        Args:
+            params (dict): {
+                'id': noteId (required),
+                'deckName': parent deck name (required),
+                'fields': {fieldName: value, ...} (optional - text fields),
+                'audioFields': {fieldName: audioUrl, ...} (optional - audio from URLs)
+            }
+            
+        Returns:
+            dict: Updated note information
+        """
         collection = self.collection()
         if collection is None:
-            return
-
-        note = collection.getNote(params['id'])
-        if note is None:
-            raise Exception("Failed to get note:{}".format(params['id']))
-        for name, value in params['fields'].items():
+            raise Exception("Collection not available")
+        
+        # Validate deck name is provided and not empty
+        deck_name = params.get('deckName')
+        if deck_name is None:
+            raise Exception("Deck name is required")
+        if not deck_name or deck_name.strip() == '':
+            raise Exception("Deck name cannot be empty")
+        
+        # Validate note ID
+        note_id = params.get('id')
+        if note_id is None:
+            raise Exception("Note ID is required")
+        
+        # Get the note
+        try:
+            note = collection.getNote(note_id)
+        except Exception as e:
+            raise Exception(f"Failed to get note with ID {note_id}: {str(e)}")
+        
+        # Validate that at least ONE card belongs to the specified deck or subdeck
+        cards = note.cards()
+        if not cards:
+            raise Exception(f"Note {note_id} has no cards")
+        
+        has_match = False
+        
+        for card in cards:
+            card_deck_name = collection.decks.get(card.did)['name']
+            
+            # Case-sensitive check: exact match or subdeck
+            if card_deck_name == deck_name or card_deck_name.startswith(deck_name + '::'):
+                has_match = True
+                break  # Found a match, exit immediately
+        
+        if not has_match:
+            raise Exception(
+                f"Note {note_id} does not belong to deck '{deck_name}' or its subdecks"
+            )
+        
+        # Update text fields
+        fields = params.get('fields', {})
+        for name, value in fields.items():
             if name in note:
                 note[name] = value
-        note.flush()
+            else:
+                raise Exception(f"Field '{name}' not found in note type '{note.note_type()['name']}'")
+        
+        # Update audio fields
+        audio_fields = params.get('audioFields', {})
+        for field_name, audio_url in audio_fields.items():
+            if field_name not in note:
+                raise Exception(f"Field '{field_name}' not found in note type '{note.note_type()['name']}'")
+            
+            if not audio_url or not verifyString(audio_url):
+                raise Exception(f"Invalid audio URL for field '{field_name}'")
+            
+            try:
+                # Download audio file from URL
+                audio_data = download(audio_url)
+                if audio_data is None or len(audio_data) == 0:
+                    raise Exception(f"Failed to download audio from URL: {audio_url}")
+                
+                # Generate unique filename from URL
+                import urllib.parse
+                parsed_url = urllib.parse.urlparse(audio_url)
+                url_filename = os.path.basename(parsed_url.path)
+                
+                if url_filename and '.' in url_filename:
+                    # Use filename from URL with unique timestamp
+                    timestamp = int(time())
+                    name, ext = os.path.splitext(url_filename)
+                    audio_filename = f"{name}_{timestamp}{ext}"
+                else:
+                    # Generate completely new filename
+                    timestamp = int(time())
+                    url_hash = hashlib.md5(audio_url.encode('utf-8')).hexdigest()[:8]
+                    audio_filename = f"audio_{timestamp}_{url_hash}.mp3"
+                
+                # Ensure filename has no directory components
+                audio_filename = os.path.basename(audio_filename)
+                
+                # Store audio file in media folder
+                self.media().writeData(audio_filename, audio_data)
+                
+                # Replace field content with audio reference
+                note[field_name] = f'[sound:{audio_filename}]'
+                
+            except Exception as e:
+                raise Exception(f"Failed to process audio for field '{field_name}': {str(e)}")
+        
+        # Validate that at least one field was provided
+        if not fields and not audio_fields:
+            raise Exception("No fields or audioFields provided to update")
+        
+        # Save note using modern API (creates undo entry)
+        self.startEditing()
+        collection.update_note(note)
+        collection.autosave()
+        self.stopEditing()
+        
+        # Return updated note information
+        return {
+            'noteId': note.id,
+            'fields': {name: note[name] for name in note.keys()},
+            'tags': note.tags,
+            'modelName': note.note_type()['name'],
+            'cards': [card.id for card in note.cards()]
+        }
 
     def addTags(self, notes, tags, add=True):
         self.startEditing()
@@ -1435,6 +1549,51 @@ class AnkiConnect:
 
     @webApi()
     def updateNoteFields(self, note):
+        """
+        Update note fields with optional audio download and deck validation (unified API)
+        
+        Args:
+            note (dict): {
+                'id': noteId (required),
+                'deckName': parent deck name (required) - validates note belongs to this deck,
+                'fields': {fieldName: value, ...} (optional - text fields),
+                'audioFields': {fieldName: audioUrl, ...} (optional - audio from URLs)
+            }
+            
+        Returns:
+            dict: Updated note information including noteId, fields, tags, modelName, and card IDs
+            
+        Examples:
+            # Update text fields only
+            updateNoteFields({
+                'id': 1234567890,
+                'deckName': 'local_67769a9c-6770-44ec-8c88-81190f6e78bd',
+                'fields': {'Front': 'New text', 'Back': 'Updated'}
+            })
+            
+            # Update audio field only
+            updateNoteFields({
+                'id': 1234567890,
+                'deckName': 'MyDeck',
+                'audioFields': {'Audio': 'https://example.com/audio.mp3'}
+            })
+            
+            # Update both text and audio
+            updateNoteFields({
+                'id': 1234567890,
+                'deckName': 'MyDeck',
+                'fields': {'Front': 'New text'},
+                'audioFields': {'Audio': 'https://example.com/audio.mp3'}
+            })
+            
+        Note:
+            - deckName is REQUIRED - validates at least one card belongs to deck or subdeck
+            - Card timing data (intervals, ease, due dates) is automatically preserved
+            - Audio replaces the entire field content with [sound:filename.mp3]
+            - All cards from the same note are updated with new field values
+            - Creates an undo entry in Anki
+            - Case-sensitive deck matching
+        """
         return self.anki.updateNoteFields(note)
 
     @webApi()
@@ -1847,6 +2006,74 @@ class AnkiConnect:
             deckName, newCardsPerDay, reviewsPerDay, studyForgottenToday, extendNewLimit
         )
     
+    @webApi()
+    def getNoteIds(self, deckName=None, page=1, pageSize=50, query=None):
+        """
+        Get a paginated list of note IDs using an optional deck name and/or search query.
+
+        Supports the same search syntax as Anki's card browser (e.g. "flag:1", "is:due",
+        "tag:mytag", "front:hello", "added:7", etc.).
+
+        At least one of 'deckName' or 'query' must be provided.
+
+        Args:
+            deckName (str, optional): Name of the parent deck (subdecks automatically included)
+            page (int): 1-indexed page number (default: 1)
+            pageSize (int): Number of note IDs per page (default: 50)
+            query (str, optional): Anki search query string — same syntax as the card browser.
+                                   If both deckName and query are given, they are ANDed together.
+
+        Returns:
+            dict: {
+                'noteIds': list of note IDs for the requested page,
+                'page': current page number,
+                'pageSize': page size used,
+                'total': total number of matching notes,
+                'totalPages': total number of pages,
+                'query': the final query string that was executed
+            }
+        """
+        return NoteManager(self.anki).getNoteIds(deckName, page, pageSize, query)
+
+    @webApi()
+    def deleteNote(self, noteId, deckName):
+        """
+        Delete a note and all its cards by note ID.
+
+        Args:
+            noteId (int): ID of the note to delete
+            deckName (str): Parent deck name. At least one card of the note must
+                            belong to this deck or one of its subdecks — the
+                            request is rejected otherwise.
+
+        Returns:
+            bool: True if successful
+        """
+        return NoteManager(self.anki).deleteNote(noteId, deckName)
+
+    @webApi()
+    def undoAnswerCard(self, cardId, deckName):
+        """
+        Undo the most recent answer for a specific card.
+
+        Deletes the most recent revlog entry for the card and restores the card's
+        scheduling state to what it was before that answer. The card will be
+        immediately available in the review queue after undo.
+
+        Args:
+            cardId (int): ID of the card whose most recent answer should be undone
+            deckName (str): Parent deck name. The card must belong to this deck or
+                            one of its subdecks — the request is rejected otherwise.
+
+        Returns:
+            dict: {
+                'cardId': int,
+                'restoredState': str,    # 'new', 'learning', or 'review'
+                'restoredInterval': int  # interval the card had before the answer
+            }
+        """
+        return StudyManager(self.anki).undoAnswerCard(cardId, deckName)
+
     @webApi()
     def getDeckReviewsByDay(self, deckName, days=14):
         """
