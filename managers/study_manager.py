@@ -100,7 +100,21 @@ class StudyManager:
     
     def answerCard(self, cardId, ease, timeTakenSeconds=None):
         """
-        Answer a card with the specified ease
+        Answer a card with the specified ease.
+
+        For the v3 scheduler, Anki's Rust backend enforces a "top of queue"
+        contract: only the card most recently returned by get_queued_cards()
+        (for the currently selected deck) can be answered via answer_card_raw.
+
+        In a multi-user setup, concurrent calls to getNextReviewCard() for
+        different decks keep overwriting the globally selected deck, so by the
+        time answerCard() is called the wrong deck may be active, causing the
+        "not at top of queue" error.
+
+        Fix: re-select the card's own deck and re-fetch it through the
+        scheduler (sched.getCard) before answering. This registers the card
+        with the Rust backend under the correct deck context without
+        interfering with other users' sessions.
         
         Args:
             cardId (int): ID of the card to answer
@@ -114,29 +128,56 @@ class StudyManager:
         collection = self.collection()
         if collection is None:
             return False
-            
+
+        # Validate card exists and capture its deck ID before editing begins
         try:
-            card = collection.getCard(cardId)
+            db_card = collection.getCard(cardId)
+        except Exception:
+            raise Exception(f"Card with ID '{cardId}' does not exist")
+
+        # Validate ease
+        if ease < 1 or ease > 4:
+            raise Exception(f"Invalid ease value '{ease}'. Must be between 1-4")
+
+        self.startEditing()
+
+        try:
+            # Re-select the card's own deck so that get_queued_cards() (called
+            # internally by the Rust backend during answer_card_raw) returns
+            # cards from the correct deck.  This is the key fix for multi-user
+            # operation: each answerCard call re-establishes its own deck
+            # context instead of relying on whatever deck was last selected by
+            # any user's getNextReviewCard call.
+            collection.decks.select(db_card.did)
+
+            # Fetch the card through the scheduler.  sched.getCard() calls
+            # get_queued_cards() which registers the card with the Rust
+            # backend as the "current" card, satisfying answer_card_raw's
+            # "top of queue" validation.
+            card = collection.sched.getCard()
+
             if card is None:
-                raise Exception(f"Card with ID '{cardId}' does not exist")
-            
-            # Validate ease
-            if ease < 1 or ease > 4:
-                raise Exception(f"Invalid ease value '{ease}'. Must be between 1-4")
-            
-            self.startEditing()
-            
-            # Start the timer
-            card.startTimer()
-            
-            # Answer the card
+                raise Exception(
+                    f"No card is currently available in the review queue "
+                    f"for the deck containing card {cardId}"
+                )
+
+            if card.id != cardId:
+                raise Exception(
+                    f"Card {cardId} is not at the top of its deck's review queue "
+                    f"(the next queued card is {card.id}). "
+                    f"This can happen if a learning-step card became due between "
+                    f"getNextReviewCard and answerCard."
+                )
+
+            # Answer the card (card already has its timer started by sched.getCard)
             collection.sched.answerCard(card, ease)
-            
+
             # If custom time was provided, update the revlog entry directly
             if timeTakenSeconds is not None:
                 # Convert seconds to milliseconds
                 time_ms = int(timeTakenSeconds * 1000)
-                
+
                 # Update the most recent revlog entry for this card
                 # The entry was just created by answerCard()
                 collection.db.execute(
@@ -145,11 +186,11 @@ class StudyManager:
                     ")",
                     time_ms, cardId
                 )
-            
+
             collection.autosave()
             self.stopEditing()
             return True
-            
+
         except Exception as e:
             self.stopEditing()
             raise e
