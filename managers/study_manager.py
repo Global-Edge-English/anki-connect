@@ -103,25 +103,33 @@ class StudyManager:
         Answer a card with the specified ease.
 
         For the v3 scheduler, Anki's Rust backend enforces a "top of queue"
-        contract: only the card most recently returned by get_queued_cards()
-        (for the currently selected deck) can be answered via answer_card_raw.
+        contract: only the card at position 0 of get_queued_cards() (for the
+        currently selected deck) can be answered via answer_card_raw.
 
-        In a multi-user setup, concurrent calls to getNextReviewCard() for
-        different decks keep overwriting the globally selected deck, so by the
-        time answerCard() is called the wrong deck may be active, causing the
-        "not at top of queue" error.
+        Race condition: in a multi-user setup, a learning-step card may become
+        due BETWEEN the client's getNextReviewCard call and this answerCard
+        call (e.g. user spends several minutes on a card). When that happens,
+        the learning card jumps to position 0, blocking the target card.
 
-        Fix: re-select the card's own deck and re-fetch it through the
-        scheduler (sched.getCard) before answering. This registers the card
-        with the Rust backend under the correct deck context without
-        interfering with other users' sessions.
-        
+        Fix: re-select the card's own deck, then loop through the queue. Any
+        card that is NOT the target is temporarily suspended (removed from
+        queue) so the target rises to position 0. Once answered, all
+        temporarily suspended cards are immediately unsuspended in a finally
+        block — their scheduling state (due timestamp, interval, factor) is
+        fully preserved.
+
+        Side effects of the suspend/unsuspend cycle:
+          - The blocking card's mod/usn is bumped (causes a harmless sync).
+          - Daily study counts and card scheduling data are NOT affected.
+          - Single-threaded execution means no other user observes the
+            suspended state.
+
         Args:
             cardId (int): ID of the card to answer
             ease (int): Ease/difficulty rating (1=Again, 2=Hard, 3=Good, 4=Easy)
-            timeTakenSeconds (float, optional): Time taken to answer in seconds. 
+            timeTakenSeconds (float, optional): Time taken to answer in seconds.
                                                If not provided, defaults to 0.
-            
+
         Returns:
             bool: True if successful
         """
@@ -139,47 +147,60 @@ class StudyManager:
         if ease < 1 or ease > 4:
             raise Exception(f"Invalid ease value '{ease}'. Must be between 1-4")
 
+        # Re-select the card's own deck so get_queued_cards() returns cards
+        # from the correct deck context (fixes the multi-user deck-switching
+        # problem where another user's getNextReviewCard may have changed the
+        # globally selected deck).
+        collection.decks.select(db_card.did)
+
         self.startEditing()
 
-        try:
-            # Re-select the card's own deck so that get_queued_cards() (called
-            # internally by the Rust backend during answer_card_raw) returns
-            # cards from the correct deck.  This is the key fix for multi-user
-            # operation: each answerCard call re-establishes its own deck
-            # context instead of relying on whatever deck was last selected by
-            # any user's getNextReviewCard call.
-            collection.decks.select(db_card.did)
+        # Cards temporarily suspended to let the target card reach position 0.
+        # Always unsuspended in the finally block regardless of outcome.
+        temporarily_suspended = []
 
-            # Fetch the card through the scheduler.  sched.getCard() calls
-            # get_queued_cards() which registers the card with the Rust
-            # backend as the "current" card, satisfying answer_card_raw's
-            # "top of queue" validation.
-            card = collection.sched.getCard()
+        try:
+            # Safety limit: at most this many blocking cards will be moved
+            # aside. In practice the number is 0 (normal path) or 1-2 (race
+            # condition with learning-step cards). If somehow more cards are
+            # blocking, we give up and raise a clear error.
+            MAX_SKIP = 10
+
+            card = None
+            while len(temporarily_suspended) <= MAX_SKIP:
+                queued = collection.sched.getCard()
+
+                if queued is None:
+                    raise Exception(
+                        f"Card {cardId} is not in the review queue for its deck. "
+                        f"It may be suspended, buried, or not yet due."
+                    )
+
+                if queued.id == cardId:
+                    # Target card is now at the top of the queue — ready to answer.
+                    card = queued
+                    break
+
+                # This card is blocking our target (e.g. a learning-step card
+                # that became due while the user was studying). Temporarily
+                # suspend it so the next getCard() call skips it.
+                collection.sched.suspendCards([queued.id])
+                temporarily_suspended.append(queued.id)
 
             if card is None:
                 raise Exception(
-                    f"No card is currently available in the review queue "
-                    f"for the deck containing card {cardId}"
+                    f"Card {cardId} could not be reached in the review queue after "
+                    f"skipping {len(temporarily_suspended)} other cards. "
+                    f"This is unexpected — please check the deck configuration."
                 )
 
-            if card.id != cardId:
-                raise Exception(
-                    f"Card {cardId} is not at the top of its deck's review queue "
-                    f"(the next queued card is {card.id}). "
-                    f"This can happen if a learning-step card became due between "
-                    f"getNextReviewCard and answerCard."
-                )
-
-            # Answer the card (card already has its timer started by sched.getCard)
+            # Answer the card (card already has its timer started by getCard())
             collection.sched.answerCard(card, ease)
 
-            # If custom time was provided, update the revlog entry directly
+            # If custom time was provided, update the revlog entry directly.
+            # The entry was just created by answerCard().
             if timeTakenSeconds is not None:
-                # Convert seconds to milliseconds
                 time_ms = int(timeTakenSeconds * 1000)
-
-                # Update the most recent revlog entry for this card
-                # The entry was just created by answerCard()
                 collection.db.execute(
                     "UPDATE revlog SET time = ? WHERE id = ("
                     "SELECT id FROM revlog WHERE cid = ? ORDER BY id DESC LIMIT 1"
@@ -188,12 +209,21 @@ class StudyManager:
                 )
 
             collection.autosave()
-            self.stopEditing()
-            return True
 
-        except Exception as e:
+        finally:
+            # Always restore temporarily suspended blocking cards.
+            # Their scheduling state (due timestamp, interval, factor, type)
+            # is fully preserved by the Anki backend on unsuspend.
+            if temporarily_suspended:
+                try:
+                    collection.sched.unsuspendCards(temporarily_suspended)
+                except Exception:
+                    # Log but don't mask the original error (if any).
+                    pass
+
             self.stopEditing()
-            raise e
+
+        return True
     
     def resetCard(self, cardId):
         """
