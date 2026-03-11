@@ -51,7 +51,29 @@ class StudyManager:
         card = collection.sched.getCard()
         if card is None:
             return None
-            
+
+        # Determine deck IDs for this deck + subdecks (used for lastAnsweredCardId query)
+        if deckName:
+            deck_ids = [deck['id']]
+            for did, deck_obj in collection.decks.decks.items():
+                if deck_obj['name'].startswith(deckName + '::'):
+                    deck_ids.append(int(did))
+        else:
+            deck_ids = None  # all decks
+
+        # Find the most recently answered card for this deck scope
+        if deck_ids is not None:
+            deck_ids_str = ','.join(str(did) for did in deck_ids)
+            last_answered = collection.db.scalar(
+                f"SELECT cid FROM revlog "
+                f"WHERE cid IN (SELECT id FROM cards WHERE did IN ({deck_ids_str})) "
+                f"ORDER BY id DESC LIMIT 1"
+            )
+        else:
+            last_answered = collection.db.scalar(
+                "SELECT cid FROM revlog ORDER BY id DESC LIMIT 1"
+            )
+
         # Get card information
         model = card.model()
         note = card.note()
@@ -95,7 +117,8 @@ class StudyManager:
             'type': card.type,
             'noteId': card.nid,
             'buttons': self._getAnswerButtons(card),
-            'flagged': card.flags > 0
+            'flagged': card.flags > 0,
+            'lastAnsweredCardId': last_answered
         }
     
     def answerCard(self, cardId, ease, timeTakenSeconds=None):
@@ -160,37 +183,41 @@ class StudyManager:
         temporarily_suspended = []
 
         try:
-            # Safety limit: at most this many blocking cards will be moved
-            # aside. In practice the number is 0 (normal path) or 1-2 (race
-            # condition with learning-step cards). If somehow more cards are
-            # blocking, we give up and raise a clear error.
-            MAX_SKIP = 10
+            # Use a single batch-peek to find the target card in the queue,
+            # then batch-suspend everything ahead of it in one DB call.
+            # This is O(1) DB operations regardless of how many cards are
+            # ahead, and handles any deck size efficiently.
+            #
+            # fetch_limit=10000 returns all queued cards for the current
+            # session; after the due-value fix in undoAnswerCard the target
+            # will always be within the first handful of results.
+            queued_cards = collection.sched.get_queued_cards(fetch_limit=10000)
 
-            card = None
-            while len(temporarily_suspended) <= MAX_SKIP:
-                queued = collection.sched.getCard()
-
-                if queued is None:
-                    raise Exception(
-                        f"Card {cardId} is not in the review queue for its deck. "
-                        f"It may be suspended, buried, or not yet due."
-                    )
-
-                if queued.id == cardId:
-                    # Target card is now at the top of the queue — ready to answer.
-                    card = queued
+            to_suspend = []
+            found = False
+            for qc in queued_cards.cards:
+                if qc.card.id == cardId:
+                    found = True
                     break
+                to_suspend.append(qc.card.id)
 
-                # This card is blocking our target (e.g. a learning-step card
-                # that became due while the user was studying). Temporarily
-                # suspend it so the next getCard() call skips it.
-                collection.sched.suspendCards([queued.id])
-                temporarily_suspended.append(queued.id)
-
-            if card is None:
+            if not found:
                 raise Exception(
-                    f"Card {cardId} could not be reached in the review queue after "
-                    f"skipping {len(temporarily_suspended)} other cards. "
+                    f"Card {cardId} is not in the review queue for its deck. "
+                    f"It may be suspended, buried, or not yet due."
+                )
+
+            # Batch-suspend everything ahead of the target card (one DB call).
+            if to_suspend:
+                collection.sched.suspendCards(to_suspend)
+                temporarily_suspended = to_suspend
+
+            card = collection.sched.getCard()
+
+            if card is None or card.id != cardId:
+                raise Exception(
+                    f"Card {cardId} could not be reached at queue position 0 "
+                    f"after suspending {len(temporarily_suspended)} blocking card(s). "
                     f"This is unexpected — please check the deck configuration."
                 )
 
@@ -993,23 +1020,29 @@ class StudyManager:
 
             elif last_ivl < 0:
                 # Card was in a LEARNING step — restore to learning queue.
-                # due for learning cards is a unix timestamp in seconds;
-                # setting it to now makes the card available immediately.
+                # Setting due=0 (Unix epoch, year 1970) makes this the most
+                # overdue learning card possible, guaranteeing it will be
+                # returned first by get_queued_cards() ahead of all other
+                # learning, new, and review cards.
                 card.type = 1
                 card.queue = 1
                 card.ivl = 0
-                card.due = int(time_module.time())
+                card.due = 0
                 card.factor = prior_factor
                 card.flush()
                 restored_state = 'learning'
 
             else:
                 # Card was a mature REVIEW card — restore to review queue.
-                # due=today makes it appear immediately in today's review pile.
+                # Setting due=today-999999 (≈2700 years ago) makes this the
+                # most overdue review card possible, placing it ahead of all
+                # other review cards in the queue. Only intraday learning cards
+                # (typically 0–3) can appear before it, so answerCard's
+                # batch-peek approach suspends at most a handful of blockers.
                 card.type = 2
                 card.queue = 2
                 card.ivl = last_ivl
-                card.due = today
+                card.due = today - 999999
                 card.factor = prior_factor
                 card.flush()
                 restored_state = 'review'
