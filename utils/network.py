@@ -6,6 +6,7 @@
 import select
 import socket
 import os
+import time
 from unicodedata import normalize
 from .helpers import makeBytes, makeStr, getMimeType
 
@@ -26,9 +27,15 @@ class AjaxClient:
         self.handler = handler
         self.readBuff = bytes()
         self.writeBuff = bytes()
+        self.lastActivity = time.time()
+        self.closeAfterSend = False
 
     def advance(self, recvSize=1024):
         if self.sock is None:
+            return False
+
+        if time.time() - self.lastActivity > 30:
+            self.close()
             return False
 
         rlist, wlist = select.select([self.sock], [self.sock], [], 0)[:2]
@@ -39,17 +46,22 @@ class AjaxClient:
                 self.close()
                 return False
 
+            self.lastActivity = time.time()
             self.readBuff += msg
 
             req, length = self.parseRequest(self.readBuff)
             if req is not None:
                 self.readBuff = self.readBuff[length:]
+                connHeader = req.headers.get(makeBytes('connection'), b'')
+                if makeStr(connHeader).lower().strip() == 'close':
+                    self.closeAfterSend = True
                 self.writeBuff += self.handler(req)
 
         if wlist and self.writeBuff:
             length = self.sock.send(self.writeBuff)
             self.writeBuff = self.writeBuff[length:]
-            if not self.writeBuff:
+            self.lastActivity = time.time()
+            if not self.writeBuff and self.closeAfterSend:
                 self.close()
                 return False
 
@@ -110,7 +122,9 @@ class AjaxServer:
         self.headers = [
             ['HTTP/1.1 200 OK', None],
             ['Content-Type', 'text/json'],
-            ['Access-Control-Allow-Origin', '*']
+            ['Access-Control-Allow-Origin', '*'],
+            ['Connection', 'keep-alive'],
+            ['Keep-Alive', 'timeout=30']
         ]
         self.extraHeaders = {}
 
@@ -143,6 +157,7 @@ class AjaxServer:
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         self.sock.setblocking(False)
         self.sock.bind((address, port))
         self.sock.listen(backlog)
@@ -217,6 +232,8 @@ class AjaxServer:
             resp += makeBytes('Content-Length: {}\r\n'.format(len(file_content)))
             resp += makeBytes('Access-Control-Allow-Origin: *\r\n')
             resp += makeBytes('Cache-Control: public, max-age=31536000\r\n')  # Cache for 1 year
+            resp += makeBytes('Connection: keep-alive\r\n')
+            resp += makeBytes('Keep-Alive: timeout=30\r\n')
             resp += makeBytes('\r\n')
             resp += file_content
             
@@ -241,9 +258,11 @@ class AjaxServer:
         resp += makeBytes('Content-Type: text/plain\r\n')
         resp += makeBytes('Content-Length: {}\r\n'.format(len(body)))
         resp += makeBytes('Access-Control-Allow-Origin: *\r\n')
+        resp += makeBytes('Connection: keep-alive\r\n')
+        resp += makeBytes('Keep-Alive: timeout=30\r\n')
         resp += makeBytes('\r\n')
         resp += body
-        
+
         return resp
 
     def close(self):
