@@ -183,41 +183,52 @@ class StudyManager:
         temporarily_suspended = []
 
         try:
-            # Use a single batch-peek to find the target card in the queue,
-            # then batch-suspend everything ahead of it in one DB call.
-            # This is O(1) DB operations regardless of how many cards are
-            # ahead, and handles any deck size efficiently.
+            # Iteratively suspend blockers until the target card reaches
+            # queue position 0. A single pass is not enough because the v3
+            # scheduler's Intersperser re-interleaves new/review cards after
+            # each queue rebuild (triggered by suspendCards clearing the
+            # in-memory queue). The changed ratio can promote cards that were
+            # previously AFTER the target to BEFORE it.
             #
-            # fetch_limit=10000 returns all queued cards for the current
-            # session; after the due-value fix in undoAnswerCard the target
-            # will always be within the first handful of results.
-            queued_cards = collection.sched.get_queued_cards(fetch_limit=10000)
+            # Each iteration: peek the queue, suspend any new blockers ahead
+            # of the target, then check if getCard() returns the target.
+            # suspended_set tracks all cards across iterations so the finally
+            # block can unsuspend them all.
+            MAX_ATTEMPTS = 5
+            suspended_set = set()
+            card = None
 
-            to_suspend = []
-            found = False
-            for qc in queued_cards.cards:
-                if qc.card.id == cardId:
-                    found = True
+            for attempt in range(MAX_ATTEMPTS):
+                queued_cards = collection.sched.get_queued_cards(fetch_limit=10000)
+
+                to_suspend = []
+                found = False
+                for qc in queued_cards.cards:
+                    if qc.card.id == cardId:
+                        found = True
+                        break
+                    if qc.card.id not in suspended_set:
+                        to_suspend.append(qc.card.id)
+
+                if not found:
+                    raise Exception(
+                        f"Card {cardId} is not in the review queue for its deck. "
+                        f"It may be suspended, buried, or not yet due."
+                    )
+
+                if to_suspend:
+                    collection.sched.suspendCards(to_suspend)
+                    suspended_set.update(to_suspend)
+                    temporarily_suspended = list(suspended_set)
+
+                card = collection.sched.getCard()
+                if card is not None and card.id == cardId:
                     break
-                to_suspend.append(qc.card.id)
-
-            if not found:
-                raise Exception(
-                    f"Card {cardId} is not in the review queue for its deck. "
-                    f"It may be suspended, buried, or not yet due."
-                )
-
-            # Batch-suspend everything ahead of the target card (one DB call).
-            if to_suspend:
-                collection.sched.suspendCards(to_suspend)
-                temporarily_suspended = to_suspend
-
-            card = collection.sched.getCard()
-
-            if card is None or card.id != cardId:
+            else:
                 raise Exception(
                     f"Card {cardId} could not be reached at queue position 0 "
-                    f"after suspending {len(temporarily_suspended)} blocking card(s). "
+                    f"after {MAX_ATTEMPTS} attempts, suspending "
+                    f"{len(suspended_set)} blocking card(s) total. "
                     f"This is unexpected — please check the deck configuration."
                 )
 
