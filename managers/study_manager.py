@@ -183,17 +183,18 @@ class StudyManager:
         temporarily_suspended = []
 
         try:
-            # Iteratively suspend blockers until the target card reaches
-            # queue position 0. A single pass is not enough because the v3
-            # scheduler's Intersperser re-interleaves new/review cards after
-            # each queue rebuild (triggered by suspendCards clearing the
-            # in-memory queue). The changed ratio can promote cards that were
-            # previously AFTER the target to BEFORE it.
+            # Suspend ALL non-target cards in the queue so the target card
+            # reaches position 0. We suspend cards both before AND after the
+            # target because the v3 scheduler's Intersperser re-interleaves
+            # new/review cards after each queue rebuild — cards that were
+            # after the target can be promoted before it. By suspending all
+            # non-target cards in one pass, we avoid the whack-a-mole problem
+            # that occurs when only cards ahead of the target are suspended.
             #
-            # Each iteration: peek the queue, suspend any new blockers ahead
-            # of the target, then check if getCard() returns the target.
-            # suspended_set tracks all cards across iterations so the finally
-            # block can unsuspend them all.
+            # Multiple iterations are still possible if the queue rebuild
+            # surfaces cards not in the original fetch (e.g., from sibling
+            # decks). suspended_set tracks all cards across iterations so the
+            # finally block can unsuspend them all.
             MAX_ATTEMPTS = 5
             suspended_set = set()
             card = None
@@ -206,8 +207,7 @@ class StudyManager:
                 for qc in queued_cards.cards:
                     if qc.card.id == cardId:
                         found = True
-                        break
-                    if qc.card.id not in suspended_set:
+                    elif qc.card.id not in suspended_set:
                         to_suspend.append(qc.card.id)
 
                 if not found:
