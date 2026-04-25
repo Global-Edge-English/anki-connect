@@ -67,7 +67,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.1.8"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.1.10"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -270,23 +270,23 @@ class AnkiBridge:
                     audioInject(note, params.audio.fields, params.audio.filename)
                     self.media().writeData(params.audio.filename, data)
 
-        self.startEditing()
-        
-        # Use modern Anki API with explicit deck_id to ensure note is created in correct deck
-        # This avoids the issue where notes would sometimes be created in the notetype's default deck
+        # Modern Anki (2.1.50+): collection.add_note() runs inside a Rust
+        # transaction and fires the note_will_be_added hook + UI ops itself.
+        # The legacy startEditing/stopEditing wrap calls aqt.mw.requireReset()
+        # which is obsolete — it prints a stack trace and forces a full UI
+        # reset on every call. Skip it here for latency.
         try:
-            # Try modern add_note() API (Anki 2.1.50+)
             collection.add_note(note, deck['id'])
         except (AttributeError, TypeError):
-            # Fall back to deprecated addNote() for older Anki versions
-            collection.addNote(note)
-            # Move cards to correct deck if needed (only for older versions)
-            cardIds = [card.id for card in note.cards()]
-            if cardIds:
-                self.changeDeck(cardIds, params.deckName)
-        
-        collection.autosave()
-        self.stopEditing()
+            # Older Anki: keep the legacy path including UI reset wrapper.
+            self.startEditing()
+            try:
+                collection.addNote(note)
+                cardIds = [card.id for card in note.cards()]
+                if cardIds:
+                    self.changeDeck(cardIds, params.deckName)
+            finally:
+                self.stopEditing()
 
         return note.id
 
@@ -1871,8 +1871,8 @@ class AnkiConnect:
 
     # Study Management - Direct usage  
     @webApi()
-    def getNextReviewCard(self, deckName=None):
-        return StudyManager(self.anki).getNextReviewCard(deckName)
+    def getNextReviewCard(self, deckName=None, needRender=False):
+        return StudyManager(self.anki).getNextReviewCard(deckName, needRender)
 
     @webApi()
     def answerCard(self, cardId, ease, timeTakenSeconds=None):

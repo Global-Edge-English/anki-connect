@@ -26,48 +26,66 @@ class StudyManager:
         """Stop editing session"""
         self.bridge.stopEditing()
 
-    def getNextReviewCard(self, deckName=None):
+    def getNextReviewCard(self, deckName=None, needRender=False):
         """
-        Get the next card due for review from a specific deck or all decks
-        
+        Get the next card due for review from a specific deck or all decks.
+
         Args:
-            deckName (str, optional): Name of the deck to get cards from
-            
+            deckName (str, optional): Name of the deck to get cards from.
+            needRender (bool): When True, render the card's question/answer
+                HTML via Anki's template engine. Defaults to False because
+                rendering is the dominant CPU cost in this call (Tera +
+                cloze + JS/MathJax glue) and most polling clients don't
+                need it. When False, `question` and `answer` are None.
+
         Returns:
-            dict: Card information if available, None if no cards due
+            dict: Card information if available, None if no cards due.
         """
         collection = self.collection()
         if collection is None:
             return None
-        
-        # If deck specified, set it as current
+
+        # If deck specified, set it as current. decks.select() persists
+        # current_deck_id to the collection config — guard so polling
+        # clients don't trigger a DB write on every call.
         if deckName:
             deck = collection.decks.byName(deckName)
             if deck is None:
                 raise Exception(f"Deck '{deckName}' does not exist")
-            collection.decks.select(deck['id'])
-        
-        # Get next card from scheduler
-        card = collection.sched.getCard()
-        if card is None:
-            return None
+            if collection.decks.selected() != deck['id']:
+                collection.decks.select(deck['id'])
 
-        # Determine deck IDs for this deck + subdecks (used for lastAnsweredCardId query)
+        # Fetch top card + its scheduling states in a single backend call.
+        # This replaces sched.getCard() + get_scheduling_states() + (later)
+        # part of _getAnswerButtons — saving two RPC roundtrips.
+        from anki.cards import Card as AnkiCard
+        queued = collection._backend.get_queued_cards(fetch_limit=1, intraday_learning_only=False)
+        if not queued.cards:
+            return None
+        queued_card = queued.cards[0]
+        card = AnkiCard(collection, backend_card=queued_card.card)
+        states = queued_card.states
+
+        # Determine deck IDs for this deck + subdecks (used for
+        # lastAnsweredCardId query). deck_and_child_ids is a single backend
+        # RPC that returns parent + all descendant ids, replacing an O(N)
+        # Python iteration over collection.decks.decks for every call.
         if deckName:
-            deck_ids = [deck['id']]
-            for did, deck_obj in collection.decks.decks.items():
-                if deck_obj['name'].startswith(deckName + '::'):
-                    deck_ids.append(int(did))
+            deck_ids = list(collection.decks.deck_and_child_ids(deck['id']))
         else:
             deck_ids = None  # all decks
 
-        # Find the most recently answered card for this deck scope
+        # Find the most recently answered card for this deck scope.
+        # Uses INNER JOIN over the subquery form so SQLite can walk the
+        # revlog PK index in reverse and stop at the first matching row,
+        # instead of filtering every revlog row against an IN-subquery.
         if deck_ids is not None:
             deck_ids_str = ','.join(str(did) for did in deck_ids)
             last_answered = collection.db.scalar(
-                f"SELECT cid FROM revlog "
-                f"WHERE cid IN (SELECT id FROM cards WHERE did IN ({deck_ids_str})) "
-                f"ORDER BY id DESC LIMIT 1"
+                f"SELECT r.cid FROM revlog r "
+                f"INNER JOIN cards c ON r.cid = c.id "
+                f"WHERE c.did IN ({deck_ids_str}) "
+                f"ORDER BY r.id DESC LIMIT 1"
             )
         else:
             last_answered = collection.db.scalar(
@@ -78,27 +96,29 @@ class StudyManager:
         model = card.model()
         note = card.note()
         template = card.template()
-        
+
         fields = {}
         for info in model['flds']:
             order = info['ord']
             name = info['name']
             fields[name] = {'value': note.fields[order], 'order': order}
-        
-        # Get question and answer with version compatibility
-        try:
-            # Try new Anki 2.1.50+ API
-            question = card.question()
-            answer = card.answer()
-        except (AttributeError, TypeError):
-            # Fall back to older API
+
+        # Render question/answer only when the caller asks for them.
+        if needRender:
             try:
-                qa = card._getQA()
-                question = qa['q']
-                answer = qa['a']
-            except:
-                question = ""
-                answer = ""
+                question = card.question()
+                answer = card.answer()
+            except (AttributeError, TypeError):
+                try:
+                    qa = card._getQA()
+                    question = qa['q']
+                    answer = qa['a']
+                except Exception:
+                    question = ""
+                    answer = ""
+        else:
+            question = None
+            answer = None
         
         return {
             'cardId': card.id,
@@ -116,7 +136,7 @@ class StudyManager:
             'queue': card.queue,
             'type': card.type,
             'noteId': card.nid,
-            'buttons': self._getAnswerButtons(card),
+            'buttons': self._getAnswerButtons(card, states=states),
             'flagged': card.flags > 0,
             'lastAnsweredCardId': last_answered
         }
@@ -125,33 +145,33 @@ class StudyManager:
         """
         Answer a card with the specified ease.
 
-        For the v3 scheduler, Anki's Rust backend enforces a "top of queue"
-        contract: only the card at position 0 of get_queued_cards() (for the
-        currently selected deck) can be answered via answer_card_raw.
+        Uses Anki's grade_now backend RPC, which answers any card by ID
+        regardless of its queue position. This is the mechanism Anki's
+        browser "Grade Now" feature uses.
 
-        Race condition: in a multi-user setup, a learning-step card may become
-        due BETWEEN the client's getNextReviewCard call and this answerCard
-        call (e.g. user spends several minutes on a card). When that happens,
-        the learning card jumps to position 0, blocking the target card.
+        Why not sched.answer_card / sched.answerCard? Anki's Rust backend
+        enforces a "top of queue" check inside pop_entry(), reached whenever
+        CardAnswer.from_queue is true. The proto-to-Rust conversion at the
+        service boundary hardcodes from_queue=true, so every RPC path EXCEPT
+        grade_now hits that check. grade_now manually flips from_queue=false
+        after conversion, skipping the queue-position requirement entirely.
 
-        Fix: re-select the card's own deck, then loop through the queue. Any
-        card that is NOT the target is temporarily suspended (removed from
-        queue) so the target rises to position 0. Once answered, all
-        temporarily suspended cards are immediately unsuspended in a finally
-        block — their scheduling state (due timestamp, interval, factor) is
-        fully preserved.
+        Scenarios this fixes:
+          1. Cross-day answer: card fetched on day N, answered on day N+1
+             after overnight new-card surfacing shuffled the queue.
+          2. Rapid "again" streaks: many learning cards churn through the
+             queue at short intervals, displacing the target from position 0.
 
-        Side effects of the suspend/unsuspend cycle:
-          - The blocking card's mod/usn is bumped (causes a harmless sync).
-          - Daily study counts and card scheduling data are NOT affected.
-          - Single-threaded execution means no other user observes the
-            suspended state.
+        Earlier workarounds (suspending blockers to push the target to
+        position 0) could not converge because get_queued_cards returns a
+        bounded batch — suspending cards causes the scheduler to surface
+        more from the waiting pool to fill the daily budget.
 
         Args:
             cardId (int): ID of the card to answer
             ease (int): Ease/difficulty rating (1=Again, 2=Hard, 3=Good, 4=Easy)
             timeTakenSeconds (float, optional): Time taken to answer in seconds.
-                                               If not provided, defaults to 0.
+                                               Defaults to 0 if not provided.
 
         Returns:
             bool: True if successful
@@ -160,9 +180,9 @@ class StudyManager:
         if collection is None:
             return False
 
-        # Validate card exists and capture its deck ID before editing begins
+        # Validate card exists and capture deck_id for the post-answer stats update
         try:
-            db_card = collection.getCard(cardId)
+            deck_id = collection.getCard(cardId).did
         except Exception:
             raise Exception(f"Card with ID '{cardId}' does not exist")
 
@@ -170,73 +190,30 @@ class StudyManager:
         if ease < 1 or ease > 4:
             raise Exception(f"Invalid ease value '{ease}'. Must be between 1-4")
 
-        # Re-select the card's own deck so get_queued_cards() returns cards
-        # from the correct deck context (fixes the multi-user deck-switching
-        # problem where another user's getNextReviewCard may have changed the
-        # globally selected deck).
-        collection.decks.select(db_card.did)
-
         self.startEditing()
-
-        # Cards temporarily suspended to let the target card reach position 0.
-        # Always unsuspended in the finally block regardless of outcome.
-        temporarily_suspended = []
-
         try:
-            # Suspend ALL non-target cards in the queue so the target card
-            # reaches position 0. We suspend cards both before AND after the
-            # target because the v3 scheduler's Intersperser re-interleaves
-            # new/review cards after each queue rebuild — cards that were
-            # after the target can be promoted before it. By suspending all
-            # non-target cards in one pass, we avoid the whack-a-mole problem
-            # that occurs when only cards ahead of the target are suspended.
-            #
-            # Multiple iterations are still possible if the queue rebuild
-            # surfaces cards not in the original fetch (e.g., from sibling
-            # decks). suspended_set tracks all cards across iterations so the
-            # finally block can unsuspend them all.
-            MAX_ATTEMPTS = 5
-            suspended_set = set()
-            card = None
+            from anki.scheduler.v3 import CardAnswer
 
-            for attempt in range(MAX_ATTEMPTS):
-                queued_cards = collection.sched.get_queued_cards(fetch_limit=10000)
+            rating_map = {
+                1: CardAnswer.AGAIN,
+                2: CardAnswer.HARD,
+                3: CardAnswer.GOOD,
+                4: CardAnswer.EASY,
+            }
 
-                to_suspend = []
-                found = False
-                for qc in queued_cards.cards:
-                    if qc.card.id == cardId:
-                        found = True
-                    elif qc.card.id not in suspended_set:
-                        to_suspend.append(qc.card.id)
+            # grade_now is the only RPC that sets from_queue=false inside the
+            # Rust backend, so it skips the "not at top of queue" check in
+            # pop_entry(). It still writes the revlog, updates card scheduling
+            # state, and increments the deck's new/review daily counters.
+            collection._backend.grade_now(
+                card_ids=[cardId],
+                rating=rating_map[ease],
+            )
 
-                if not found:
-                    raise Exception(
-                        f"Card {cardId} is not in the review queue for its deck. "
-                        f"It may be suspended, buried, or not yet due."
-                    )
-
-                if to_suspend:
-                    collection.sched.suspendCards(to_suspend)
-                    suspended_set.update(to_suspend)
-                    temporarily_suspended = list(suspended_set)
-
-                card = collection.sched.getCard()
-                if card is not None and card.id == cardId:
-                    break
-            else:
-                raise Exception(
-                    f"Card {cardId} could not be reached at queue position 0 "
-                    f"after {MAX_ATTEMPTS} attempts, suspending "
-                    f"{len(suspended_set)} blocking card(s) total. "
-                    f"This is unexpected — please check the deck configuration."
-                )
-
-            # Answer the card (card already has its timer started by getCard())
-            collection.sched.answerCard(card, ease)
-
-            # If custom time was provided, update the revlog entry directly.
-            # The entry was just created by answerCard().
+            # grade_now hardcodes milliseconds_taken to 0 in the internal
+            # CardAnswer it builds. That zero flows into both the revlog
+            # `time` field and the deck's millisecond_delta stat. Patch both
+            # if the caller provided a real timing value.
             if timeTakenSeconds is not None:
                 time_ms = int(timeTakenSeconds * 1000)
                 collection.db.execute(
@@ -245,20 +222,8 @@ class StudyManager:
                     ")",
                     time_ms, cardId
                 )
-
-            collection.autosave()
-
+                collection.sched.update_stats(deck_id, milliseconds_delta=time_ms)
         finally:
-            # Always restore temporarily suspended blocking cards.
-            # Their scheduling state (due timestamp, interval, factor, type)
-            # is fully preserved by the Anki backend on unsuspend.
-            if temporarily_suspended:
-                try:
-                    collection.sched.unsuspendCards(temporarily_suspended)
-                except Exception:
-                    # Log but don't mask the original error (if any).
-                    pass
-
             self.stopEditing()
 
         return True
@@ -383,24 +348,27 @@ class StudyManager:
         cardIds = collection.findCards(query)
         return cardIds[:limit] if limit else cardIds
     
-    def _getAnswerButtons(self, card):
+    def _getAnswerButtons(self, card, states=None):
         """
         Get available answer buttons for a card with timing information
-        
+
         Args:
             card: Anki card object
-            
+            states: Pre-fetched SchedulingStates. If provided, skips the
+                extra get_scheduling_states backend call. Pass this when
+                the caller already fetched states (e.g. via get_queued_cards).
+
         Returns:
             list: List of button dictionaries with ease, label, and timing
         """
         collection = self.collection()
         if collection is None:
             return []
-            
+
         try:
             # Get button count from scheduler
             buttonCount = collection.sched.answerButtons(card)
-            
+
             # Button labels mapping
             button_labels = {
                 1: "Again",
@@ -408,12 +376,12 @@ class StudyManager:
                 3: "Good" if buttonCount >= 4 else "Easy",
                 4: "Easy"
             }
-            
+
             # Try to get timing information (v3 scheduler)
             timings = []
             try:
-                # Get scheduling states for the card from backend
-                states = collection._backend.get_scheduling_states(card.id)
+                if states is None:
+                    states = collection._backend.get_scheduling_states(card.id)
                 # Get timing labels for each button from backend
                 timing_labels = collection._backend.describe_next_states(states)
                 timings = list(timing_labels)
@@ -1097,41 +1065,42 @@ class StudyManager:
             raise Exception(f"Deck '{deckName}' does not exist")
         
         deck_id = deck['id']
-        
-        # Get all deck IDs (parent + children)
-        deck_ids = [deck_id]
-        for did, deck_obj in collection.decks.decks.items():
-            if deck_obj['name'].startswith(deckName + '::'):
-                deck_ids.append(int(did))
-        
+
+        # Get all deck IDs (parent + descendants) via the cached backend RPC.
+        # Replaces an O(total_decks) Python iteration over collection.decks.decks.
+        deck_ids = list(collection.decks.deck_and_child_ids(deck_id))
         deck_ids_str = ','.join(str(did) for did in deck_ids)
-        
+
         # Get day cutoff from scheduler (this is when "today" ENDS, typically 4am tomorrow)
         day_cutoff = collection.sched.day_cutoff
-        
+
         # Calculate start of "today" in Anki's system (24 hours before day_cutoff)
         day_start = day_cutoff - 86400
-        
+
         # Calculate timestamp for N days ago
         cutoff_timestamp = (day_cutoff - (days * 86400)) * 1000
-        
-        # Query revlog using Anki's approach
-        # This matches the _done() method in stats.py
+
+        # Query revlog using INNER JOIN onto cards. Replaces the IN-subquery
+        # form (cid IN (SELECT id FROM cards WHERE did IN (...))) so SQLite
+        # can walk the revlog primary-key index from the cutoff forward and
+        # join into cards by id, instead of materializing the cards subquery
+        # and probing per revlog row.
         query = f"""
-            SELECT 
-                cast((id/1000.0 - ?) / 86400.0 as int) as day,
-                sum(case when type = 0 then 1 else 0 end) as learning,
-                sum(case when type = 1 then 1 else 0 end) as review,
-                sum(case when type = 2 then 1 else 0 end) as relearn,
-                sum(case when type = 3 then 1 else 0 end) as filtered,
+            SELECT
+                cast((r.id/1000.0 - ?) / 86400.0 as int) as day,
+                sum(case when r.type = 0 then 1 else 0 end) as learning,
+                sum(case when r.type = 1 then 1 else 0 end) as review,
+                sum(case when r.type = 2 then 1 else 0 end) as relearn,
+                sum(case when r.type = 3 then 1 else 0 end) as filtered,
                 count(*) as total
-            FROM revlog
-            WHERE id > ?
-                AND cid IN (SELECT id FROM cards WHERE did IN ({deck_ids_str}))
+            FROM revlog r
+            INNER JOIN cards c ON r.cid = c.id
+            WHERE r.id > ?
+                AND c.did IN ({deck_ids_str})
             GROUP BY day
             ORDER BY day
         """
-        
+
         results = collection.db.all(query, day_cutoff, cutoff_timestamp)
         
         # Process results into a more readable format

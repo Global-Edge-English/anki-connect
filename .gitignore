@@ -47,6 +47,7 @@ collection.anki21
 # Config files with sensitive data (both template and user configs)
 config.json
 user_config.json
+.env
 
 # Build artifacts
 *.zip
@@ -66,3 +67,4 @@ htmlcov/
 Thumbs.db
 .directory
 .Trash-*
+.claude/settings.json

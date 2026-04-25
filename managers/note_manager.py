@@ -522,13 +522,13 @@ class NoteManager:
     def getDeckInfo(self, deckName, includeTimeStats=True, period="allTime", wantSingleDeckStats=False):
         """
         Get detailed information about a deck and its child decks
-        
+
         Args:
             deckName (str): Name of the deck
             includeTimeStats (bool): Whether to include time statistics (default: True)
             period (str): Time period for stats - "today", "last7days", "last30days", "allTime"
             wantSingleDeckStats (bool): If True, returns only the single deck's stats (no child decks) (default: False)
-            
+
         Returns:
             list: Array of deck information. If wantSingleDeckStats is True, returns only [parent_deck_info].
                   Otherwise, if deck has children, returns [child1_info, child2_info, ...].
@@ -537,134 +537,126 @@ class NoteManager:
         collection = self.collection()
         if collection is None:
             return None
-            
+
         deck = collection.decks.byName(deckName)
         if deck is None:
             return None
-        
-        # Get the deck tree with counts that respect daily limits
+
+        # Build a deck-id → tree-node index ONCE so per-deck lookups are O(1)
+        # instead of an O(N) walk via collection.decks.find_deck_in_tree per
+        # child (was O(N²) total for a parent with many children).
         tree = collection.sched.deck_due_tree()
-        
-        # Helper function to get deck info
-        def getDeckStatsInfo(deckObj, deckId):
-            # Find the specific deck node in the tree
-            deckNode = collection.decks.find_deck_in_tree(tree, deckId)
-            
-            if deckNode is None:
-                return None
-            
-            # Use the scheduler's counts which respect daily limits
-            deckInfo = {
-                'id': deckId,
-                'name': deckObj['name'],
-                'newCount': deckNode.new_count,  # Respects daily new card limit
-                'learningCount': deckNode.learn_count,
-                'reviewCount': deckNode.review_count,  # Respects daily review limit
-                'totalCards': deckNode.total_including_children,  # Total cards in deck and children
-                'isFiltered': bool(deckObj.get('dyn', 0))  # True if this is a filtered/dynamic deck
+        tree_index = {}
+        def _index(node):
+            tree_index[int(node.deck_id)] = node
+            for child in node.children:
+                _index(child)
+        _index(tree)
+
+        # Resolve the set of decks we'll compute stats for. children() is one
+        # backend RPC over a cached deck-name lookup and returns ALL descendants,
+        # replacing the O(total_decks) Python loop over collection.decks.decks.
+        if wantSingleDeckStats:
+            target_decks = [(deck['name'], int(deck['id']), deck)]
+        else:
+            descendants = list(collection.decks.children(deck['id']))
+            if descendants:
+                target_decks = []
+                for child_name, child_id in descendants:
+                    child_deck = collection.decks.get(child_id)
+                    if child_deck is not None:
+                        target_decks.append((child_name, int(child_id), child_deck))
+                target_decks.sort(key=lambda x: x[0])
+            else:
+                target_decks = [(deck['name'], int(deck['id']), deck)]
+
+        # Compute time stats for ALL target decks in one query. Replaces N
+        # separate revlog scans with one INNER JOIN + GROUP BY — biggest win
+        # on collections with many child decks and a large revlog.
+        time_stats = {}
+        period_desc = ""
+        if includeTimeStats and target_decks:
+            from datetime import datetime, timedelta
+
+            if period == "today":
+                cutoff = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                cutoff_ts = int(cutoff.timestamp() * 1000)
+                period_desc = "today"
+            elif period == "last7days":
+                cutoff_ts = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
+                period_desc = "last 7 days"
+            elif period == "last30days":
+                cutoff_ts = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
+                period_desc = "last 30 days"
+            else:
+                cutoff_ts = 0
+                period_desc = "all time"
+
+            deck_ids = [did for _, did, _ in target_decks]
+            placeholders = ','.join('?' * len(deck_ids))
+            rows = collection.db.all(
+                f"SELECT c.did, COUNT(*), SUM(r.time), AVG(r.time) "
+                f"FROM revlog r INNER JOIN cards c ON r.cid = c.id "
+                f"WHERE r.id > ? AND c.did IN ({placeholders}) "
+                f"GROUP BY c.did",
+                cutoff_ts, *deck_ids,
+            )
+            for did, count, total_ms, avg_ms in rows:
+                time_stats[int(did)] = (count, total_ms or 0, avg_ms or 0)
+
+        # Build the result list.
+        result = []
+        for deck_name_full, deck_id, deck_obj in target_decks:
+            node = tree_index.get(deck_id)
+            if node is None:
+                continue
+
+            info = {
+                'id': deck_id,
+                'name': deck_obj['name'],
+                'newCount': node.new_count,
+                'learningCount': node.learn_count,
+                'reviewCount': node.review_count,
+                'totalCards': node.total_including_children,
+                'isFiltered': bool(deck_obj.get('dyn', 0)),
             }
-            
-            # Add daily card limits from deck configuration
+
             try:
-                config = collection.decks.confForDid(deckId)
+                config = collection.decks.confForDid(deck_id)
                 if config is not None:
-                    deckInfo['newCardsPerDay'] = config.get('new', {}).get('perDay', 0)
-                    deckInfo['reviewsPerDay'] = config.get('rev', {}).get('perDay', 0)
+                    info['newCardsPerDay'] = config.get('new', {}).get('perDay', 0)
+                    info['reviewsPerDay'] = config.get('rev', {}).get('perDay', 0)
                 else:
-                    # Config not found, use defaults
-                    deckInfo['newCardsPerDay'] = 0
-                    deckInfo['reviewsPerDay'] = 0
+                    info['newCardsPerDay'] = 0
+                    info['reviewsPerDay'] = 0
             except Exception:
-                # If there's any error getting config (e.g., filtered decks), use defaults
-                deckInfo['newCardsPerDay'] = 0
-                deckInfo['reviewsPerDay'] = 0
-            
-            # Add time statistics if requested
+                info['newCardsPerDay'] = 0
+                info['reviewsPerDay'] = 0
+
             if includeTimeStats:
-                from datetime import datetime, timedelta
-                
-                # Calculate timestamp based on period
-                if period == "today":
-                    cutoff = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-                    cutoffTimestamp = int(cutoff.timestamp() * 1000)
-                    periodDesc = "today"
-                elif period == "last7days":
-                    cutoff = datetime.now() - timedelta(days=7)
-                    cutoffTimestamp = int(cutoff.timestamp() * 1000)
-                    periodDesc = "last 7 days"
-                elif period == "last30days":
-                    cutoff = datetime.now() - timedelta(days=30)
-                    cutoffTimestamp = int(cutoff.timestamp() * 1000)
-                    periodDesc = "last 30 days"
-                else:  # allTime
-                    cutoffTimestamp = 0
-                    periodDesc = "all time"
-                
-                # Query review log for time statistics for this specific deck
-                query = """
-                    select 
-                        count(*) as review_count,
-                        sum(time) as total_time_ms,
-                        avg(time) as avg_time_ms
-                    from revlog 
-                    where id > ? and cid in (select id from cards where did = ?)
-                """
-                
-                timeResult = collection.db.first(query, cutoffTimestamp, deckId)
-                
-                if timeResult and timeResult[0] > 0:
-                    review_count, total_time_ms, avg_time_ms = timeResult
-                    total_time_seconds = (total_time_ms / 1000.0) if total_time_ms else 0.0
-                    avg_time_seconds = (avg_time_ms / 1000.0) if avg_time_ms else 0.0
-                    
-                    deckInfo['timeStats'] = {
-                        'period': periodDesc,
-                        'totalReviews': review_count,
-                        'totalTimeSeconds': round(total_time_seconds, 2),
-                        'averageTimePerCardSeconds': round(avg_time_seconds, 2)
+                stats = time_stats.get(deck_id)
+                if stats and stats[0] > 0:
+                    count, total_ms, avg_ms = stats
+                    info['timeStats'] = {
+                        'period': period_desc,
+                        'totalReviews': count,
+                        'totalTimeSeconds': round(total_ms / 1000.0, 2),
+                        'averageTimePerCardSeconds': round(avg_ms / 1000.0, 2),
                     }
                 else:
-                    deckInfo['timeStats'] = {
-                        'period': periodDesc,
+                    info['timeStats'] = {
+                        'period': period_desc,
                         'totalReviews': 0,
                         'totalTimeSeconds': 0.0,
-                        'averageTimePerCardSeconds': 0.0
+                        'averageTimePerCardSeconds': 0.0,
                     }
-            
-            return deckInfo
-        
-        # If wantSingleDeckStats is True, return only the single deck (no children)
-        if wantSingleDeckStats:
-            parentInfo = getDeckStatsInfo(deck, deck['id'])
-            if parentInfo is None:
-                return None
-            return [parentInfo]
-        
-        # Find all child decks
-        childDecks = []
-        for deckId, deckObj in collection.decks.decks.items():
-            # Check if this deck is a direct or nested child of the specified deck
-            if deckObj['name'].startswith(deckName + '::'):
-                childDecks.append((deckObj['name'], int(deckId), deckObj))
-        
-        # Sort child decks by name for consistent ordering
-        childDecks.sort(key=lambda x: x[0])
-        
-        result = []
-        
-        # If there are child decks, return only the children (not the parent)
-        if childDecks:
-            for childName, childId, childDeck in childDecks:
-                childInfo = getDeckStatsInfo(childDeck, childId)
-                if childInfo is not None:
-                    # Strip the parent deck prefix from the name
-                    childInfo['name'] = childName.replace(deckName + '::', '', 1)
-                    result.append(childInfo)
-        else:
-            # No children, return just the parent deck
-            parentInfo = getDeckStatsInfo(deck, deck['id'])
-            if parentInfo is None:
-                return None
-            result.append(parentInfo)
-        
+
+            # Children get the parent prefix stripped from their name (legacy behavior).
+            if not wantSingleDeckStats and deck_name_full != deck['name']:
+                info['name'] = deck_name_full.replace(deckName + '::', '', 1)
+
+            result.append(info)
+
+        if not result:
+            return None
         return result
