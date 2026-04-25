@@ -14,6 +14,14 @@ else:
     web = request
 
 URL_TIMEOUT = 10
+USER_AGENT = "AnkiConnect/GlobalEdge"
+
+try:
+    import requests as _requests
+    _session = _requests.Session()
+    _session.headers["User-Agent"] = USER_AGENT
+except ImportError:
+    _session = None
 
 
 def makeBytes(data):
@@ -27,15 +35,27 @@ def makeStr(data):
 
 
 def download(url):
-    """Download content from a URL"""
+    """Download content from a URL.
+
+    Uses a module-level requests.Session so HTTPS connections are pooled and
+    TLS handshakes amortize across notes added in the same Anki session.
+    """
+    if _session is not None:
+        try:
+            resp = _session.get(url, timeout=URL_TIMEOUT)
+        except _requests.RequestException:
+            return None
+        if resp.status_code != 200:
+            return None
+        return resp.content
+
+    req = web.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        resp = web.urlopen(url, timeout=URL_TIMEOUT)
+        resp = web.urlopen(req, timeout=URL_TIMEOUT)
     except web.URLError:
         return None
-
     if resp.code != 200:
         return None
-
     return resp.read()
 
 
