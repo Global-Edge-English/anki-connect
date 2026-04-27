@@ -5,7 +5,8 @@
       "Read(//Users/vasundhara/anki/**)",
       "Read(//Users/vasundhara/studyplan2021/**)",
       "Read(//Users/vasundhara/**)",
-      "Bash(python3 -m py_compile managers/study_manager.py)"
+      "Bash(python3 -m py_compile managers/study_manager.py)",
+      "Bash(python -c ' *)"
     ]
   }
 }

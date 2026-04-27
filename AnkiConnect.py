@@ -67,7 +67,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.1.10"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.1.12"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = 25
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -2079,15 +2079,33 @@ class AnkiConnect:
         """
         Get the number of reviews completed per day for the last N days.
         Uses the same approach as Anki's built-in statistics calendar.
-        
+
         Args:
             deckName (str): Name of the deck
             days (int): Number of days to look back (default: 14)
-            
+
         Returns:
             dict: Daily review statistics with breakdown by card type (learning, review, relearn, filtered)
         """
         return StudyManager(self.anki).getDeckReviewsByDay(deckName, days)
+
+    @webApi()
+    def getDeckReviewsByDayMulti(self, deckNames, days=14):
+        """
+        Batched version of getDeckReviewsByDay for many decks. Replaces
+        N×(2 queries) with 2 SQLite queries total — intended for callers
+        that previously fanned out via callAnkiMulti.
+
+        Args:
+            deckNames (list[str]): Deck names to fetch stats for.
+            days (int): Number of days to look back (default: 14).
+
+        Returns:
+            list[dict]: Per-deck results in the same order as deckNames,
+            each with the same shape as getDeckReviewsByDay. Missing
+            decks return empty stats rather than raising.
+        """
+        return StudyManager(self.anki).getDeckReviewsByDayMulti(deckNames, days)
 
 #
 #   Entry

@@ -94,14 +94,10 @@ class StudyManager:
 
         # Get card information
         model = card.model()
-        note = card.note()
         template = card.template()
 
-        fields = {}
-        for info in model['flds']:
-            order = info['ord']
-            name = info['name']
-            fields[name] = {'value': note.fields[order], 'order': order}
+        raw_flds = collection.db.scalar("SELECT flds FROM notes WHERE id = ?", card.nid).split("\x1f")
+        fields = {info['name']: {'value': raw_flds[info['ord']], 'order': info['ord']} for info in model['flds']}
 
         # Render question/answer only when the caller asks for them.
         if needRender:
@@ -365,49 +361,19 @@ class StudyManager:
         if collection is None:
             return []
 
+        button_labels = {1: "Again", 2: "Hard", 3: "Good", 4: "Easy"}
+
         try:
-            # Get button count from scheduler
-            buttonCount = collection.sched.answerButtons(card)
+            if states is None:
+                states = collection._backend.get_scheduling_states(card.id)
+            timings = list(collection._backend.describe_next_states(states))
+        except Exception:
+            timings = ["", "", "", ""]
 
-            # Button labels mapping
-            button_labels = {
-                1: "Again",
-                2: "Hard" if buttonCount >= 4 else "Good",
-                3: "Good" if buttonCount >= 4 else "Easy",
-                4: "Easy"
-            }
-
-            # Try to get timing information (v3 scheduler)
-            timings = []
-            try:
-                if states is None:
-                    states = collection._backend.get_scheduling_states(card.id)
-                # Get timing labels for each button from backend
-                timing_labels = collection._backend.describe_next_states(states)
-                timings = list(timing_labels)
-            except (AttributeError, Exception):
-                # Fallback for older versions or if method not available
-                timings = [""] * buttonCount
-            
-            # Build button info with ease, label, and timing
-            buttons = []
-            for i in range(1, buttonCount + 1):
-                buttons.append({
-                    'ease': i,
-                    'label': button_labels.get(i, f"Button {i}"),
-                    'timing': timings[i - 1] if i <= len(timings) else ""
-                })
-            
-            return buttons
-            
-        except Exception as e:
-            # Default buttons if scheduler method fails
-            return [
-                {'ease': 1, 'label': 'Again', 'timing': ''},
-                {'ease': 2, 'label': 'Hard', 'timing': ''},
-                {'ease': 3, 'label': 'Good', 'timing': ''},
-                {'ease': 4, 'label': 'Easy', 'timing': ''}
-            ]
+        return [
+            {'ease': i, 'label': button_labels[i], 'timing': timings[i - 1] if i <= len(timings) else ""}
+            for i in range(1, 5)
+        ]
     
     def getStudyStats(self, deckName=None):
         """
@@ -1144,3 +1110,148 @@ class StudyManager:
             'averagePerDay': avg_per_day,
             'newCardsAvailable': new_cards_available
         }
+
+    def getDeckReviewsByDayMulti(self, deckNames, days=14):
+        """
+        Batched version of getDeckReviewsByDay across many decks.
+
+        Replaces N callers each running 2 SQLite queries with one revlog
+        query and one new-cards query for the whole batch, then rolls up
+        per-deck in Python. Designed for callers that previously fanned
+        out via callAnkiMulti.
+
+        Missing decks are returned with empty stats (no exception) so a
+        single bad deck doesn't fail the batch.
+
+        Args:
+            deckNames (list[str]): Deck names to fetch stats for.
+            days (int): Number of days to look back (default: 14).
+
+        Returns:
+            list[dict]: Results in the same order as deckNames, each
+            with the same shape as getDeckReviewsByDay.
+        """
+        from datetime import datetime
+
+        collection = self.collection()
+        if collection is None:
+            raise Exception("Collection not available")
+
+        if not deckNames:
+            return []
+
+        # Resolve each requested deck to its descendant did set, and build
+        # a child_did -> requested deckName map for rollup. If two requested
+        # decks overlap (one is an ancestor of another), the later one wins
+        # for the overlap; overlapping inputs are not a supported pattern.
+        child_to_parent = {}
+        all_dids = set()
+        for deckName in deckNames:
+            deck = collection.decks.byName(deckName)
+            if deck is None:
+                continue
+            descendant_dids = collection.decks.deck_and_child_ids(deck['id'])
+            for did in descendant_dids:
+                child_to_parent[did] = deckName
+                all_dids.add(did)
+
+        empty_result = lambda dn: {
+            'deckName': dn,
+            'days': days,
+            'stats': [],
+            'totalReviews': 0,
+            'averagePerDay': 0.0,
+            'newCardsAvailable': 0,
+        }
+
+        if not all_dids:
+            return [empty_result(dn) for dn in deckNames]
+
+        day_cutoff = collection.sched.day_cutoff
+        day_start = day_cutoff - 86400
+        cutoff_timestamp = (day_cutoff - (days * 86400)) * 1000
+        all_dids_str = ','.join(str(d) for d in all_dids)
+
+        # One revlog scan for the whole batch, grouped by deck and day.
+        # INNER JOIN into cards keeps the revlog PK scan from cutoff
+        # forward instead of materializing an IN-subquery.
+        revlog_query = f"""
+            SELECT
+                c.did as did,
+                cast((r.id/1000.0 - ?) / 86400.0 as int) as day,
+                sum(case when r.type = 0 then 1 else 0 end) as learning,
+                sum(case when r.type = 1 then 1 else 0 end) as review,
+                sum(case when r.type = 2 then 1 else 0 end) as relearn,
+                sum(case when r.type = 3 then 1 else 0 end) as filtered,
+                count(*) as total
+            FROM revlog r
+            INNER JOIN cards c ON r.cid = c.id
+            WHERE r.id > ?
+                AND c.did IN ({all_dids_str})
+            GROUP BY c.did, day
+        """
+        revlog_rows = collection.db.all(revlog_query, day_cutoff, cutoff_timestamp)
+
+        # One new-cards count for the whole batch, grouped by deck.
+        new_cards_query = f"""
+            SELECT did, COUNT(*)
+            FROM cards
+            WHERE did IN ({all_dids_str}) AND queue = 0
+            GROUP BY did
+        """
+        new_cards_rows = collection.db.all(new_cards_query)
+
+        # Roll up to requested parent decks.
+        new_cards_by_parent = {dn: 0 for dn in deckNames}
+        for did, cnt in new_cards_rows:
+            parent = child_to_parent.get(did)
+            if parent is not None:
+                new_cards_by_parent[parent] += cnt
+
+        # parent -> {day_offset: {learning, review, relearn, filtered, total}}
+        stats_by_parent_day = {dn: {} for dn in deckNames}
+        for row in revlog_rows:
+            did, day_offset, learning, review, relearn, filtered, total = row
+            parent = child_to_parent.get(did)
+            if parent is None:
+                continue
+            bucket = stats_by_parent_day[parent].setdefault(day_offset, {
+                'learning': 0, 'review': 0, 'relearn': 0, 'filtered': 0, 'total': 0,
+            })
+            bucket['learning'] += learning
+            bucket['review'] += review
+            bucket['relearn'] += relearn
+            bucket['filtered'] += filtered
+            bucket['total'] += total
+
+        results = []
+        for deckName in deckNames:
+            day_buckets = stats_by_parent_day.get(deckName, {})
+            stats = []
+            total_reviews = 0
+            for day_offset in sorted(day_buckets.keys()):
+                b = day_buckets[day_offset]
+                date_timestamp = day_start + (day_offset * 86400)
+                date = datetime.fromtimestamp(date_timestamp).strftime('%Y-%m-%d')
+                stats.append({
+                    'date': date,
+                    'dayNumber': day_offset,
+                    'learning': b['learning'],
+                    'review': b['review'],
+                    'relearn': b['relearn'],
+                    'filtered': b['filtered'],
+                    'total': b['total'],
+                })
+                total_reviews += b['total']
+
+            avg_per_day = round(total_reviews / days, 1) if days > 0 else 0.0
+            results.append({
+                'deckName': deckName,
+                'days': days,
+                'stats': stats,
+                'totalReviews': total_reviews,
+                'averagePerDay': avg_per_day,
+                'newCardsAvailable': new_cards_by_parent.get(deckName, 0),
+            })
+
+        return results
