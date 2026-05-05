@@ -10,6 +10,12 @@ import time
 from unicodedata import normalize
 from .helpers import makeBytes, makeStr, getMimeType
 
+# Cap on handler invocations per tick. Drain I/O fully each tick, but bound
+# how many parsed requests we dispatch back-to-back so the Qt UI thread keeps
+# yielding under bursts (handlers run on the main thread; mw.col is not
+# thread-safe).
+MAX_HANDLERS_PER_TICK = int(os.getenv('ANKICONNECT_MAX_HANDLERS_PER_TICK', '4'))
+
 
 class AjaxRequest:
     """Represents an HTTP request"""
@@ -30,7 +36,7 @@ class AjaxClient:
         self.lastActivity = time.time()
         self.closeAfterSend = False
 
-    def advance(self, recvSize=1024):
+    def advance(self, recvSize=65536):
         if self.sock is None:
             return False
 
@@ -38,32 +44,47 @@ class AjaxClient:
             self.close()
             return False
 
-        rlist, wlist = select.select([self.sock], [self.sock], [], 0)[:2]
-
-        if rlist:
+        # Drain everything currently readable. Bounded by what's in the kernel
+        # recv buffer; select(timeout=0) breaks us out as soon as it's empty.
+        while True:
+            rlist, _, _ = select.select([self.sock], [], [], 0)
+            if not rlist:
+                break
             msg = self.sock.recv(recvSize)
             if not msg:
                 self.close()
                 return False
-
             self.lastActivity = time.time()
             self.readBuff += msg
 
+        # Dispatch up to MAX_HANDLERS_PER_TICK fully-parsed requests this tick.
+        # Anything left in readBuff is processed on subsequent ticks.
+        handled = 0
+        while handled < MAX_HANDLERS_PER_TICK:
             req, length = self.parseRequest(self.readBuff)
-            if req is not None:
-                self.readBuff = self.readBuff[length:]
-                connHeader = req.headers.get(makeBytes('connection'), b'')
-                if makeStr(connHeader).lower().strip() == 'close':
-                    self.closeAfterSend = True
-                self.writeBuff += self.handler(req)
+            if req is None:
+                break
+            self.readBuff = self.readBuff[length:]
+            connHeader = req.headers.get(makeBytes('connection'), b'')
+            if makeStr(connHeader).lower().strip() == 'close':
+                self.closeAfterSend = True
+            self.writeBuff += self.handler(req)
+            handled += 1
 
-        if wlist and self.writeBuff:
-            length = self.sock.send(self.writeBuff)
-            self.writeBuff = self.writeBuff[length:]
+        # Drain whatever the kernel send buffer accepts.
+        while self.writeBuff:
+            _, wlist, _ = select.select([], [self.sock], [], 0)
+            if not wlist:
+                break
+            sent = self.sock.send(self.writeBuff)
+            if sent <= 0:
+                break
+            self.writeBuff = self.writeBuff[sent:]
             self.lastActivity = time.time()
-            if not self.writeBuff and self.closeAfterSend:
-                self.close()
-                return False
+
+        if not self.writeBuff and self.closeAfterSend:
+            self.close()
+            return False
 
         return True
 

@@ -6,7 +6,19 @@
       "Read(//Users/vasundhara/studyplan2021/**)",
       "Read(//Users/vasundhara/**)",
       "Bash(python3 -m py_compile managers/study_manager.py)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(git -C /Users/vasundhara/anki-connect-globaledge log --oneline -20 -- AnkiConnect.py)",
+      "Bash(git -C /Users/vasundhara/anki-connect-globaledge log --all --oneline --grep=\"answerCard\\\\|optimize response\\\\|not at top\\\\|last card id\" -- AnkiConnect.py)",
+      "Bash(git -C /Users/vasundhara/anki-connect-globaledge log -p --all -- AnkiConnect.py)",
+      "Bash(git -C /Users/vasundhara/anki-connect-globaledge show 3c1cf42 --stat)",
+      "Bash(git -C /Users/vasundhara/anki-connect-globaledge show 3c1cf42:managers/study_manager.py)",
+      "Bash(git -C /Users/vasundhara/anki-connect-globaledge log --all --oneline -p -- managers/study_manager.py)",
+      "Bash(git -C /Users/vasundhara/anki-connect-globaledge log --all -p -- managers/study_manager.py)",
+      "Bash(git -C /Users/vasundhara/anki-connect-globaledge show 62f5395 --stat)",
+      "Bash(git -C /Users/vasundhara/anki-connect-globaledge show 84e338c --stat)",
+      "Bash(git -C /Users/vasundhara/anki-connect-globaledge show 84e338c)",
+      "Bash(kill %1)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('/Users/vasundhara/anki-connect-globaledge/managers/study_manager.py'\\).read\\(\\)\\); print\\('ok'\\)\")"
     ]
   }
 }

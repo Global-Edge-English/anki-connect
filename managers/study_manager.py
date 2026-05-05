@@ -176,51 +176,49 @@ class StudyManager:
         if collection is None:
             return False
 
-        # Validate card exists and capture deck_id for the post-answer stats update
-        try:
-            deck_id = collection.getCard(cardId).did
-        except Exception:
-            raise Exception(f"Card with ID '{cardId}' does not exist")
-
-        # Validate ease
         if ease < 1 or ease > 4:
             raise Exception(f"Invalid ease value '{ease}'. Must be between 1-4")
 
-        self.startEditing()
-        try:
-            from anki.scheduler.v3 import CardAnswer
+        # Cheap existence check + capture deck_id for the optional stats update.
+        # collection.getCard() builds a full Card object (note join, template
+        # lookup) just to read did; the scalar avoids that.
+        deck_id = collection.db.scalar("SELECT did FROM cards WHERE id = ?", cardId)
+        if deck_id is None:
+            raise Exception(f"Card with ID '{cardId}' does not exist")
 
-            rating_map = {
-                1: CardAnswer.AGAIN,
-                2: CardAnswer.HARD,
-                3: CardAnswer.GOOD,
-                4: CardAnswer.EASY,
-            }
+        from anki.scheduler.v3 import CardAnswer
 
-            # grade_now is the only RPC that sets from_queue=false inside the
-            # Rust backend, so it skips the "not at top of queue" check in
-            # pop_entry(). It still writes the revlog, updates card scheduling
-            # state, and increments the deck's new/review daily counters.
-            collection._backend.grade_now(
-                card_ids=[cardId],
-                rating=rating_map[ease],
+        rating_map = {
+            1: CardAnswer.AGAIN,
+            2: CardAnswer.HARD,
+            3: CardAnswer.GOOD,
+            4: CardAnswer.EASY,
+        }
+
+        # grade_now is the only RPC that sets from_queue=false inside the
+        # Rust backend, so it skips the "not at top of queue" check in
+        # pop_entry(). It still writes the revlog, updates card scheduling
+        # state, and increments the deck's new/review daily counters.
+        # Runs in its own Rust transaction and emits OpChanges for the
+        # op-framework — no startEditing/stopEditing wrap needed.
+        collection._backend.grade_now(
+            card_ids=[cardId],
+            rating=rating_map[ease],
+        )
+
+        # grade_now hardcodes milliseconds_taken to 0 in the internal
+        # CardAnswer it builds. That zero flows into both the revlog
+        # `time` field and the deck's millisecond_delta stat. Patch both
+        # if the caller provided a real timing value.
+        if timeTakenSeconds is not None:
+            time_ms = int(timeTakenSeconds * 1000)
+            collection.db.execute(
+                "UPDATE revlog SET time = ? WHERE id = ("
+                "SELECT id FROM revlog WHERE cid = ? ORDER BY id DESC LIMIT 1"
+                ")",
+                time_ms, cardId
             )
-
-            # grade_now hardcodes milliseconds_taken to 0 in the internal
-            # CardAnswer it builds. That zero flows into both the revlog
-            # `time` field and the deck's millisecond_delta stat. Patch both
-            # if the caller provided a real timing value.
-            if timeTakenSeconds is not None:
-                time_ms = int(timeTakenSeconds * 1000)
-                collection.db.execute(
-                    "UPDATE revlog SET time = ? WHERE id = ("
-                    "SELECT id FROM revlog WHERE cid = ? ORDER BY id DESC LIMIT 1"
-                    ")",
-                    time_ms, cardId
-                )
-                collection.sched.update_stats(deck_id, milliseconds_delta=time_ms)
-        finally:
-            self.stopEditing()
+            collection.sched.update_stats(deck_id, milliseconds_delta=time_ms)
 
         return True
     
