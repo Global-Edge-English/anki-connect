@@ -1143,6 +1143,7 @@ class StudyManager:
         # decks overlap (one is an ancestor of another), the later one wins
         # for the overlap; overlapping inputs are not a supported pattern.
         child_to_parent = {}
+        child_did_to_suffix = {}  # did -> child deck suffix e.g. "Text", "Audio"
         all_dids = set()
         for deckName in deckNames:
             deck = collection.decks.byName(deckName)
@@ -1152,6 +1153,11 @@ class StudyManager:
             for did in descendant_dids:
                 child_to_parent[did] = deckName
                 all_dids.add(did)
+                child_deck = collection.decks.get(did)
+                if child_deck is not None:
+                    child_name = child_deck['name']
+                    if '::' in child_name:
+                        child_did_to_suffix[did] = child_name.split('::')[-1]
 
         empty_result = lambda dn: {
             'deckName': dn,
@@ -1160,6 +1166,8 @@ class StudyManager:
             'totalReviews': 0,
             'averagePerDay': 0.0,
             'newCardsAvailable': 0,
+            'newCardsAvailableText': 0,
+            'newCardsAvailableAudio': 0,
         }
 
         if not all_dids:
@@ -1199,12 +1207,17 @@ class StudyManager:
         """
         new_cards_rows = collection.db.all(new_cards_query)
 
-        # Roll up to requested parent decks.
+        # Roll up to requested parent decks, and also track per-child-deck counts.
         new_cards_by_parent = {dn: 0 for dn in deckNames}
+        new_cards_by_child_deck = {dn: {} for dn in deckNames}  # deckName -> {suffix: count}
         for did, cnt in new_cards_rows:
             parent = child_to_parent.get(did)
             if parent is not None:
                 new_cards_by_parent[parent] += cnt
+                suffix = child_did_to_suffix.get(did)
+                if suffix is not None:
+                    child_counts = new_cards_by_child_deck[parent]
+                    child_counts[suffix] = child_counts.get(suffix, 0) + cnt
 
         # parent -> {day_offset: {learning, review, relearn, filtered, total}}
         stats_by_parent_day = {dn: {} for dn in deckNames}
@@ -1243,6 +1256,7 @@ class StudyManager:
                 total_reviews += b['total']
 
             avg_per_day = round(total_reviews / days, 1) if days > 0 else 0.0
+            child_counts = new_cards_by_child_deck.get(deckName, {})
             results.append({
                 'deckName': deckName,
                 'days': days,
@@ -1250,6 +1264,8 @@ class StudyManager:
                 'totalReviews': total_reviews,
                 'averagePerDay': avg_per_day,
                 'newCardsAvailable': new_cards_by_parent.get(deckName, 0),
+                'newCardsAvailableText': child_counts.get('Text', 0),
+                'newCardsAvailableAudio': child_counts.get('Audio', 0),
             })
 
         return results
