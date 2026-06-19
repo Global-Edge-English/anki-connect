@@ -542,16 +542,27 @@ class NoteManager:
         if deck is None:
             return None
 
-        # Build a deck-id → tree-node index ONCE so per-deck lookups are O(1)
-        # instead of an O(N) walk via collection.decks.find_deck_in_tree per
-        # child (was O(N²) total for a parent with many children).
+        # Build a deck-id → due-counts index ONCE with an ITERATIVE walk that
+        # stores only plain ints — never the protobuf nodes. The previous code
+        # used a recursive nested closure (`def _index` that calls itself),
+        # which forms a reference cycle that retains the entire deck tree. Anki
+        # disables the cyclic GC at startup (aqt/main.py: gc.disable()), so that
+        # cycle was never collected and leaked the whole tree on every call.
+        # getDeckInfo is polled heavily (getCard + getOwnDeckStats), so it grew
+        # the process until OOM. Iterating + storing ints breaks the cycle and
+        # retains nothing from the backend tree past this function. See INCIDENT.md.
         tree = collection.sched.deck_due_tree()
-        tree_index = {}
-        def _index(node):
-            tree_index[int(node.deck_id)] = node
-            for child in node.children:
-                _index(child)
-        _index(tree)
+        tree_counts = {}
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            tree_counts[int(node.deck_id)] = (
+                node.new_count,
+                node.learn_count,
+                node.review_count,
+                node.total_including_children,
+            )
+            stack.extend(node.children)
 
         # Resolve the set of decks we'll compute stats for. children() is one
         # backend RPC over a cached deck-name lookup and returns ALL descendants,
@@ -607,17 +618,18 @@ class NoteManager:
         # Build the result list.
         result = []
         for deck_name_full, deck_id, deck_obj in target_decks:
-            node = tree_index.get(deck_id)
-            if node is None:
+            counts = tree_counts.get(deck_id)
+            if counts is None:
                 continue
+            new_count, learn_count, review_count, total_including_children = counts
 
             info = {
                 'id': deck_id,
                 'name': deck_obj['name'],
-                'newCount': node.new_count,
-                'learningCount': node.learn_count,
-                'reviewCount': node.review_count,
-                'totalCards': node.total_including_children,
+                'newCount': new_count,
+                'learningCount': learn_count,
+                'reviewCount': review_count,
+                'totalCards': total_including_children,
                 'isFiltered': bool(deck_obj.get('dyn', 0)),
             }
 

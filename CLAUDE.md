@@ -78,10 +78,46 @@ Iterating `collection.decks.decks` with `name.startswith(parent + '::')`
 is O(total_decks) per call and shows up immediately in users with large
 collections.
 
-### Tree walks: build a `{did: node}` index once
+### Tree walks: index once — iteratively, storing values not nodes
 
 `collection.decks.find_deck_in_tree(tree, deckId)` walks the tree per call.
-If you need it in a loop, walk the tree once into a dict and look up O(1).
+If you need it in a loop, walk the tree once into a dict and look up O(1) —
+but walk it **iteratively** (explicit stack) and store the **plain values**
+you need (ints/tuples), never the protobuf nodes. A recursive nested closure
+filling a `{did: node}` dict is the exact shape that leaked in `getDeckInfo`
+(see the GC rule below).
+
+### Memory: Anki disables the cyclic GC — no per-request reference cycles
+
+Anki calls `gc.disable()` at startup (`aqt/main.py`). Python's cyclic
+collector therefore **never runs automatically**, so any reference cycle
+created while handling a request is **never freed** — it leaks permanently
+and the process grows until the OOM killer takes Anki (and every API
+consumer) down. This actually happened: `getDeckInfo` leaked the whole deck
+tree on every call until the droplet OOM'd — see `INCIDENT.md`. Plain
+refcounted cleanup is fine; **cycles are the trap**, and the leak rate is
+`call frequency × retained size`, so polled endpoints are the worst.
+
+- **No self-referencing nested closures.** A nested `def _walk(node): ...;
+  _walk(child)` closes over its own name → a function↔cell cycle that retains
+  everything it captured. Use an iterative stack/queue and store plain values:
+  ```python
+  tree_counts = {}
+  stack = [collection.sched.deck_due_tree()]
+  while stack:
+      node = stack.pop()
+      tree_counts[int(node.deck_id)] = (node.new_count, node.review_count)  # ints
+      stack.extend(node.children)
+  ```
+- **Don't retain backend objects past the request.** Protobuf nodes from
+  `deck_due_tree()`, `get_queued_cards()` results, `Card`/`Note` objects —
+  pull out the plain fields you need and let them go; don't stash them in a
+  dict/list/closure that can form a cycle.
+- If a cycle is truly unavoidable, break it before returning (set refs to
+  `None`) or call `gc.collect()` — but prefer not creating one.
+
+**Flag in code review:** any nested `def` that recurses, any `{id: node}`
+dict or list holding backend objects, any closure capturing a large structure.
 
 ### Modern Anki APIs to prefer (2.1.50+)
 
