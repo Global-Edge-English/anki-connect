@@ -67,7 +67,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.1.15"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.1.16"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = int(os.getenv('ANKICONNECT_TICK_INTERVAL_MS', '5'))
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
@@ -1147,23 +1147,25 @@ class AnkiBridge:
             if not allowDuplicate and note.dupeOrEmpty():
                 raise Exception(f"Duplicate note detected. First field already exists.")
             
-            self.startEditing()
-            
-            # Use modern Anki API with explicit deck_id to ensure note is created in correct deck
+            # Modern Anki (2.1.50+): collection.add_note() runs in its own Rust
+            # transaction and fires the note_will_be_added + op-framework UI
+            # hooks itself. Do NOT wrap in startEditing/stopEditing - that calls
+            # the obsolete aqt.mw.requireReset(), which prints a stack trace and
+            # forces a full UI reset on every call (the addAudioNote slowdown);
+            # collection.autosave() is a deprecated no-op. Mirrors addNote().
             try:
-                # Try modern add_note() API (Anki 2.1.50+)
                 collection.add_note(note, deck['id'])
             except (AttributeError, TypeError):
-                # Fall back to deprecated addNote() for older Anki versions
-                collection.addNote(note)
-                # Move cards to correct deck if needed (only for older versions)
-                cardIds = [card.id for card in note.cards()]
-                if cardIds:
-                    self.changeDeck(cardIds, deck_name)
-            
-            collection.autosave()
-            self.stopEditing()
-            
+                # Older Anki: keep the legacy path including the UI-reset wrapper.
+                self.startEditing()
+                try:
+                    collection.addNote(note)
+                    cardIds = [card.id for card in note.cards()]
+                    if cardIds:
+                        self.changeDeck(cardIds, deck_name)
+                finally:
+                    self.stopEditing()
+
             return note.id
             
         except Exception as e:

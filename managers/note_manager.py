@@ -466,22 +466,21 @@ class NoteManager:
                 f"(note is in '{card_deck}')"
             )
 
-        self.startEditing()
+        # Modern Anki: remove_notes() runs in its own Rust transaction and fires
+        # the op-framework UI hooks itself - no startEditing/stopEditing wrapper
+        # (that calls the obsolete aqt.mw.requireReset() full UI reset) and no
+        # autosave() (deprecated no-op). Mirrors addNote/addAudioNote.
         try:
-            # Use modern remove_notes API (Anki 2.1.x)
+            from anki.notes import NoteId
+            collection.remove_notes([NoteId(noteId)])
+        except (ImportError, AttributeError, TypeError):
+            # Older Anki: legacy remNotes needs the UI-reset wrapper.
+            self.startEditing()
             try:
-                from anki.notes import NoteId
-                collection.remove_notes([NoteId(noteId)])
-            except (ImportError, AttributeError, TypeError):
-                # Fallback for older Anki versions
                 collection.remNotes([noteId])
-
-            collection.autosave()
-            self.stopEditing()
-            return True
-        except Exception as e:
-            self.stopEditing()
-            raise e
+            finally:
+                self.stopEditing()
+        return True
 
     # Utility Methods
     

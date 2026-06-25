@@ -39,24 +39,31 @@ def download(url):
 
     Uses a module-level requests.Session so HTTPS connections are pooled and
     TLS handshakes amortize across notes added in the same Anki session.
+
+    The response is ALWAYS closed (context manager). Anki runs gc.disable()
+    (aqt/main.py), so the cyclic collector never runs — and an unclosed
+    requests/urllib3 Response forms a reference cycle that retains the
+    connection and its kernel socket buffer (~tens of KB). That cycle is never
+    collected, so it leaks permanently and the process grows on every call.
+    This was the addAudioNote / audio-import leak — see INCIDENT.md.
     """
     if _session is not None:
         try:
-            resp = _session.get(url, timeout=URL_TIMEOUT)
+            with _session.get(url, timeout=URL_TIMEOUT) as resp:
+                if resp.status_code != 200:
+                    return None
+                return resp.content
         except _requests.RequestException:
             return None
-        if resp.status_code != 200:
-            return None
-        return resp.content
 
     req = web.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        resp = web.urlopen(req, timeout=URL_TIMEOUT)
+        with web.urlopen(req, timeout=URL_TIMEOUT) as resp:
+            if resp.status != 200:
+                return None
+            return resp.read()
     except web.URLError:
         return None
-    if resp.code != 200:
-        return None
-    return resp.read()
 
 
 def verifyString(string):
