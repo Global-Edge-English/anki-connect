@@ -180,27 +180,39 @@ def parseMultipartData(body, boundary):
 # AnkiNoteParams
 #
 
+class Audio:
+    """Audio spec for one note's field(s).
+
+    Module-level ON PURPOSE. This used to be defined inside
+    AnkiNoteParams.__init__, which built a brand-new class object on EVERY
+    AnkiNoteParams(...) — i.e. every addNote/addAudioNote/updateNoteFields call.
+    Each class creation makes a `type` plus its methods (function), the
+    __dict__/__weakref__ getset_descriptors, the class dict and __mro__ tuple
+    (~8 objects), and a class is a self-referential cycle (Audio <-> __mro__).
+    Anki runs gc.disable(), so every one leaked permanently — the 8 obj/call
+    addNote leak the probe found. Defined once here, it's only instantiated per
+    call (cheap, no cycle). See INCIDENT.md."""
+    def __init__(self, params):
+        self.url = params.get('url')
+        self.filename = params.get('filename')
+        self.skipHash = params.get('skipHash')
+        self.fields = params.get('fields', [])
+
+    def validate(self):
+        return (
+            verifyString(self.url) and
+            verifyString(self.filename) and os.path.dirname(self.filename) == '' and
+            verifyStringList(self.fields) and
+            (verifyString(self.skipHash) or self.skipHash is None)
+        )
+
+
 class AnkiNoteParams:
     def __init__(self, params):
         self.deckName = params.get('deckName')
         self.modelName = params.get('modelName')
         self.fields = params.get('fields', {})
         self.tags = params.get('tags', [])
-
-        class Audio:
-            def __init__(self, params):
-                self.url = params.get('url')
-                self.filename = params.get('filename')
-                self.skipHash = params.get('skipHash')
-                self.fields = params.get('fields', [])
-
-            def validate(self):
-                return (
-                    verifyString(self.url) and
-                    verifyString(self.filename) and os.path.dirname(self.filename) == '' and
-                    verifyStringList(self.fields) and
-                    (verifyString(self.skipHash) or self.skipHash is None)
-                )
 
         audio = Audio(params.get('audio', {}))
         self.audio = audio if audio.validate() else None
