@@ -6,10 +6,11 @@
 from .deck_helpers import get_direct_child_decks, get_deck_limits, update_parent_deck_silent
 from .helpers import makeBytes, makeStr, download, verifyString, verifyStringList, getMimeType, audioInject
 from .network import AjaxRequest, AjaxClient, AjaxServer
+from .config_manager import ConfigManager
 
 __all__ = [
-    'get_direct_child_decks', 
-    'get_deck_limits', 
+    'get_direct_child_decks',
+    'get_deck_limits',
     'update_parent_deck_silent',
     'makeBytes',
     'makeStr',
@@ -20,5 +21,6 @@ __all__ = [
     'audioInject',
     'AjaxRequest',
     'AjaxClient',
-    'AjaxServer'
+    'AjaxServer',
+    'ConfigManager'
 ]

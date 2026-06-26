@@ -46,19 +46,20 @@ except ImportError:
 try:
     from .utils import (
         makeBytes, makeStr, download, verifyString, verifyStringList,
-        getMimeType, audioInject, AjaxServer
+        getMimeType, audioInject, AjaxServer, ConfigManager
     )
 except ImportError:
     # Fallback for older Python versions or different import contexts
     try:
         from utils import (
             makeBytes, makeStr, download, verifyString, verifyStringList,
-            getMimeType, audioInject, AjaxServer
+            getMimeType, audioInject, AjaxServer, ConfigManager
         )
     except ImportError:
         # Final fallback - define locally
         from utils.helpers import makeBytes, makeStr, download, verifyString, verifyStringList, getMimeType, audioInject
         from utils.network import AjaxServer
+        from utils.config_manager import ConfigManager
 
 
 
@@ -69,6 +70,9 @@ except ImportError:
 API_VERSION = 5
 ADDON_VERSION = "0.1.16"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = int(os.getenv('ANKICONNECT_TICK_INTERVAL_MS', '5'))
+
+# Persisted-config key for the Tools-menu "refresh GUI after API writes" toggle.
+CONFIG_GUI_REFRESH = 'guiRefreshAfterApiWrites'
 URL_TIMEOUT = 10
 URL_UPGRADE = 'https://raw.githubusercontent.com/FooSoft/anki-connect/master/AnkiConnect.py'
 NET_ADDRESS = os.getenv('ANKICONNECT_BIND_ADDRESS', '127.0.0.1')
@@ -217,7 +221,10 @@ class AnkiNoteParams:
 
 class AnkiBridge:
     def __init__(self):
-        pass
+        # Default off; AnkiConnect._setupSettingsMenu() loads the persisted
+        # value at startup and the Tools-menu toggle flips it. undoAnswerCard
+        # reads this to decide whether to call mw.reset() after its raw writes.
+        self.guiRefreshAfterApiWrites = False
     
     def storeMediaFile(self, filename, data):
         self.deleteMediaFile(filename)
@@ -431,12 +438,13 @@ class AnkiBridge:
         if not fields and not audio_fields:
             raise Exception("No fields or audioFields provided to update")
         
-        # Save note using modern API (creates undo entry)
-        self.startEditing()
+        # Save note using modern API (creates undo entry + fires op hooks).
+        # No startEditing()/stopEditing() wrapper: requireReset() prints a stack
+        # trace + a full UI reset per call. update_note() persists directly;
+        # autosave() is a deprecated no-op. GUI refresh gated on the menu toggle.
         collection.update_note(note)
-        collection.autosave()
-        self.stopEditing()
-        
+        self.refreshGuiIfEnabled()
+
         # Return updated note information
         return {
             'noteId': note.id,
@@ -492,21 +500,19 @@ class AnkiBridge:
         collection = self.collection()
         if collection is None:
             return False
-        
-        try:
-            card = collection.getCard(cardId)
-            if card is None:
-                raise Exception(f"Card with ID '{cardId}' does not exist")
-            
-            self.startEditing()
-            card.flags = 1  # Red flag
-            card.flush()
-            collection.autosave()
-            self.stopEditing()
-            return True
-        except Exception as e:
-            self.stopEditing()
-            raise e
+
+        card = collection.getCard(cardId)
+        if card is None:
+            raise Exception(f"Card with ID '{cardId}' does not exist")
+
+        # No startEditing()/stopEditing() wrapper: requireReset() prints a stack
+        # trace and forces a full UI reset on EVERY call (the obsolete path
+        # commit 4097403 removed from addNote; it was this endpoint's 4/s crawl).
+        # card.flush() persists the flag directly; autosave() is a deprecated
+        # no-op. Mirrors undoAnswerCard.
+        card.flags = 1  # Red flag
+        card.flush()
+        return True
 
 
     def unflagCard(self, cardId):
@@ -514,21 +520,16 @@ class AnkiBridge:
         collection = self.collection()
         if collection is None:
             return False
-        
-        try:
-            card = collection.getCard(cardId)
-            if card is None:
-                raise Exception(f"Card with ID '{cardId}' does not exist")
-            
-            self.startEditing()
-            card.flags = 0  # No flag
-            card.flush()
-            collection.autosave()
-            self.stopEditing()
-            return True
-        except Exception as e:
-            self.stopEditing()
-            raise e
+
+        card = collection.getCard(cardId)
+        if card is None:
+            raise Exception(f"Card with ID '{cardId}' does not exist")
+
+        # No startEditing()/stopEditing() wrapper — see flagCard. card.flush()
+        # persists directly; the legacy wrapper only spammed requireReset().
+        card.flags = 0  # No flag
+        card.flush()
+        return True
 
 
     def isCardFlagged(self, cardId):
@@ -593,6 +594,20 @@ class AnkiBridge:
 
     def window(self):
         return aqt.mw
+
+
+    def refreshGuiIfEnabled(self):
+        """Modern, opt-in replacement for the legacy startEditing()/stopEditing()
+        wrapper. Repaints the Anki desktop UI via mw.reset() ONLY when the
+        Tools-menu 'Refresh GUI after API writes' toggle is on (default off, so
+        the headless server does no per-write UI work). Unlike requireReset() it
+        prints no stack trace; unlike maybeReset() (now a no-op) it actually
+        refreshes. Guarded — a refresh failure never fails the write."""
+        if getattr(self, 'guiRefreshAfterApiWrites', False):
+            try:
+                self.window().reset()
+            except Exception:
+                pass
 
 
     def reviewer(self):
@@ -1326,10 +1341,11 @@ class AnkiBridge:
                         # Create the deck (this will create parent hierarchy if needed)
                         collection.decks.id(target_deck_name)
                         
-                        # Move all imported cards to the target subdeck
-                        self.startEditing()
+                        # Move all imported cards to the target subdeck.
+                        # No startEditing()/stopEditing() (requireReset spam);
+                        # changeDeck persists directly. GUI refresh gated on toggle.
                         self.changeDeck(new_card_ids, target_deck_name)
-                        self.stopEditing()
+                        self.refreshGuiIfEnabled()
                         
                         # Delete the temporary imported decks (cards are already moved)
                         for temp_deck_name in new_decks:
@@ -1405,6 +1421,44 @@ class AnkiConnect:
                 'AnkiConnect',
                 'Failed to listen on port {}.\nMake sure it is available and is not in use.'.format(NET_PORT)
             )
+
+        # Persisted settings store + Tools-menu toggle. Loads the
+        # "refresh GUI after API writes" flag onto the bridge (default off).
+        self._config = ConfigManager()
+        self._setupSettingsMenu()
+
+
+    def _setupSettingsMenu(self):
+        """Add a persisted, checkable Tools-menu item: 'Global Edge: Refresh
+        GUI after API writes'. Off by default so the headless server does no
+        UI work per request; turn it on when watching the Anki desktop GUI for
+        debugging, and raw-write endpoints (e.g. undoAnswerCard) repaint the
+        reviewer/deck list via the modern mw.reset(). The setting persists
+        across restarts AND add-on updates (stored in Anki's base folder; see
+        utils/config_manager.py). Mirrors the earlier ElevenLabs settings menu."""
+        try:
+            import aqt
+            from aqt.qt import QAction
+
+            enabled = bool(self._config.get(CONFIG_GUI_REFRESH, False))
+            self.anki.guiRefreshAfterApiWrites = enabled
+
+            action = QAction('Global Edge: Refresh GUI after API writes', aqt.mw)
+            action.setCheckable(True)
+            action.setChecked(enabled)
+            action.toggled.connect(self._onToggleGuiRefresh)
+            aqt.mw.form.menuTools.addSeparator()
+            aqt.mw.form.menuTools.addAction(action)
+            self._guiRefreshAction = action  # retain ref so Qt doesn't GC it
+        except Exception:
+            pass  # never let menu setup break server startup
+
+
+    def _onToggleGuiRefresh(self, checked):
+        """Persist the toggle and update the live flag the endpoints read."""
+        enabled = bool(checked)
+        self.anki.guiRefreshAfterApiWrites = enabled
+        self._config.set(CONFIG_GUI_REFRESH, enabled)
 
 
     def advance(self):
@@ -1679,6 +1733,77 @@ class AnkiConnect:
     def addonVersion(self):
         """Get the add-on version"""
         return ADDON_VERSION
+
+
+    @webApi()
+    def gcStats(self, collect=False, topTypes=0, saveall=False):
+        """Diagnostic: Python GC / object-count snapshot for leak probing.
+
+        Anki runs gc.disable() at startup, so a per-request reference cycle is
+        never collected and leaks forever. Process RSS is too noisy to see a
+        tens-of-KB/call cycle (allocator arena churn swamps it); the count of
+        live Python objects is not. This lets a probe measure
+        objects-leaked-per-call instead of fighting RSS noise.
+
+        Args:
+            collect (bool): if True, run gc.collect() and report how many
+                cycle objects it reclaimed (the count that would have leaked
+                under Anki's disabled GC) plus the object count afterwards. A
+                probe uses this to reset to a clean baseline between endpoints;
+                it mutates process state, so don't call it on a live instance
+                you're trying to passively observe.
+            topTypes (int): if > 0, also return the N most common object types
+                by count (of the WHOLE heap — steady state plus any uncollected
+                leak; for the leak's true composition use saveall instead).
+            saveall (bool): with collect=True, histogram EXACTLY the objects
+                gc.collect() reclaims (the per-call cycle leak) via
+                DEBUG_SAVEALL, returned as 'garbageTypes'. Frees them after.
+
+        Returns:
+            dict with 'objects' (len(gc.get_objects())), 'garbage'
+            (len(gc.garbage)), 'enabled' (gc.isenabled(), expected False under
+            Anki), and — when requested — 'collected', 'objectsAfter',
+            'topTypes' ([[typeName, count], ...]).
+        """
+        import gc
+        objs = gc.get_objects()
+        result = {
+            'objects': len(objs),
+            'garbage': len(gc.garbage),
+            'enabled': gc.isenabled(),
+        }
+        if topTypes and int(topTypes) > 0:
+            from collections import Counter
+            counter = Counter(type(o).__name__ for o in objs)
+            result['topTypes'] = [list(pair) for pair in counter.most_common(int(topTypes))]
+            del counter
+        del objs  # don't retain the all-objects list past this point
+        if collect and saveall:
+            # Histogram EXACTLY the objects this collect reclaims. DEBUG_SAVEALL
+            # diverts collected cycle objects into gc.garbage instead of freeing
+            # them, so we can read the leak's true composition (the absolute heap
+            # snapshot above can't isolate it). We then drop our refs and collect
+            # again with the flag off, so the diagnostic itself leaks nothing.
+            from collections import Counter
+            prev = len(gc.garbage)
+            old_flags = gc.get_debug()
+            gc.set_debug(gc.DEBUG_SAVEALL)
+            try:
+                result['collected'] = gc.collect()
+                leaked = gc.garbage[prev:]
+                n = int(topTypes) if (topTypes and int(topTypes) > 0) else 20
+                hist = Counter(type(o).__name__ for o in leaked)
+                result['garbageTypes'] = [list(pair) for pair in hist.most_common(n)]
+                del leaked, hist
+            finally:
+                del gc.garbage[prev:]      # release our refs to the saved objects
+                gc.set_debug(old_flags)    # restore (DEBUG_SAVEALL off)
+                gc.collect()               # now actually free those cycles
+            result['objectsAfter'] = len(gc.get_objects())
+        elif collect:
+            result['collected'] = gc.collect()
+            result['objectsAfter'] = len(gc.get_objects())
+        return result
     
     @webApi()
     def debugInfo(self):

@@ -548,9 +548,9 @@ class StudyManager:
         
         deck_id = deck['id']
         current_config_id = deck.get('conf', 1)
-        
-        self.startEditing()
-        
+
+        # No startEditing()/stopEditing() wrapper (requireReset spam + full UI
+        # reset). decks.save() persists directly; GUI refresh gated on the toggle.
         try:
             # Check if this config is shared by other decks
             decks_using_config = []
@@ -594,10 +594,9 @@ class StudyManager:
             config['mod'] = anki.utils.intTime()
             config['usn'] = collection.usn()
             collection.decks.save(config)
-            collection.autosave()
-            
-            self.stopEditing()
-            
+
+            self.refreshGuiIfEnabled()
+
             # Store result before parent update
             result = {
                 'deckName': deckName,
@@ -630,10 +629,9 @@ class StudyManager:
                 update_parent_deck_silent(collection, parent_name, total_new_cards, total_reviews)
             
             return result
-            
-        except Exception as e:
-            self.stopEditing()
-            raise e
+
+        except Exception:
+            raise
     
     def extendNewCardLimit(self, deckName, additionalCards):
         """
@@ -661,9 +659,9 @@ class StudyManager:
             raise Exception("additionalCards must be > 0")
         
         deck_id = deck['id']
-        
-        self.startEditing()
-        
+
+        # No startEditing()/stopEditing() wrapper (requireReset spam + full UI
+        # reset). custom_study() persists via the Rust backend; refresh on toggle.
         try:
             # Use Anki's backend custom_study API (same as the UI uses)
             from anki.scheduler import CustomStudyRequest
@@ -679,19 +677,17 @@ class StudyManager:
             deck = collection.decks.get(deck_id)
             extend_new = deck.get('extendNew', additionalCards)
             
-            collection.autosave()
-            self.stopEditing()
-            
+            self.refreshGuiIfEnabled()
+
             return {
                 'deckName': deckName,
                 'additionalCardsAllowed': additionalCards,
                 'totalExtended': extend_new,
                 'message': f"Extended new card limit by {additionalCards} cards for today"
             }
-            
-        except Exception as e:
-            self.stopEditing()
-            raise e
+
+        except Exception:
+            raise
     
     def enableStudyForgotten(self, deckName, days=1, filteredDeckName=None):
         """
@@ -720,9 +716,9 @@ class StudyManager:
             raise Exception("days must be > 0")
         
         deck_id = source_deck['id']
-        
-        self.startEditing()
-        
+
+        # No startEditing()/stopEditing() wrapper (requireReset spam + full UI
+        # reset). custom_study() persists via the Rust backend; refresh on toggle.
         try:
             # Use Anki's backend custom_study API (same as the UI uses)
             from anki.scheduler import CustomStudyRequest
@@ -753,9 +749,8 @@ class StudyManager:
                 "select count() from cards where did = ?", filtered_deck['id']
             ) or 0
             
-            collection.autosave()
-            self.stopEditing()
-            
+            self.refreshGuiIfEnabled()
+
             return {
                 'sourceDeck': deckName,
                 'filteredDeckName': filtered_deck_name,
@@ -764,10 +759,9 @@ class StudyManager:
                 'cardsFound': card_count,
                 'message': f"Created filtered deck with {card_count} forgotten cards from last {days} day(s)"
             }
-            
-        except Exception as e:
-            self.stopEditing()
-            raise e
+
+        except Exception:
+            raise
     
     def createCustomStudy(self, deckName, newCardsPerDay=None, reviewsPerDay=None, 
                          studyForgottenToday=False, extendNewLimit=None):
@@ -918,94 +912,104 @@ class StudyManager:
         #   last_ivl < 0   → card was in a learning step (value = negative seconds for next step)
         #   last_ivl > 0   → card was a mature review card (value = days)
 
-        self.startEditing()
-        try:
-            import time as time_module
+        # No startEditing()/stopEditing() wrapper here. That legacy pair calls
+        # window().requireReset() + maybeReset() — a full Anki UI reset that
+        # prints a stack trace on every call (the obsolete path commit 4097403
+        # removed from addNote/deleteNote). It only repaints Anki's own Qt
+        # windows, which nothing watches on the headless API server; the writes
+        # below (the revlog DELETE above, card.flush(), decks.save()) persist
+        # directly and sched.reset() refreshes the in-memory counts, so the very
+        # next API read returns the undone state. autosave() is a deprecated no-op.
 
-            # ----------------------------------------------------------------
-            # Decrement the deck's "shown today" counter for the card type
-            # that was active BEFORE the answer. This is the same per-deck
-            # counter that Anki's native undo adjusts (stored as
-            # deck['newToday'] / deck['lrnToday'] / deck['revToday'], each a
-            # [day_number, count] tuple). Without this, the daily budget stays
-            # short by 1 even after the revlog entry is removed.
-            # ----------------------------------------------------------------
-            today = collection.sched.today
-            deck = collection.decks.get(card.did)
-            if deck:
-                if last_ivl == 0:
-                    today_field = 'newToday'
-                elif last_ivl < 0:
-                    today_field = 'lrnToday'
-                else:
-                    today_field = 'revToday'
-
-                today_entry = deck.get(today_field)
-                if today_entry and today_entry[0] == today and today_entry[1] > 0:
-                    deck[today_field][1] -= 1
-                    collection.decks.save(deck)
-
-            # ----------------------------------------------------------------
-            # Restore the card's scheduling state
-            # ----------------------------------------------------------------
+        # ----------------------------------------------------------------
+        # Decrement the deck's "shown today" counter for the card type
+        # that was active BEFORE the answer. This is the same per-deck
+        # counter that Anki's native undo adjusts (stored as
+        # deck['newToday'] / deck['lrnToday'] / deck['revToday'], each a
+        # [day_number, count] tuple). Without this, the daily budget stays
+        # short by 1 even after the revlog entry is removed.
+        # ----------------------------------------------------------------
+        today = collection.sched.today
+        deck = collection.decks.get(card.did)
+        if deck:
             if last_ivl == 0:
-                # Card was NEW before this answer.
-                # forgetCards() resets to queue=0 via Anki's proper pipeline.
-                collection.sched.forgetCards([cardId])
-
-                # forgetCards() assigns due = card.ord (its position number),
-                # which buries it deep in the new queue. Re-fetch and set due=0
-                # to put it at the FRONT of the new queue so it shows up next.
-                card = collection.getCard(cardId)
-                card.due = 0
-                card.flush()
-                restored_state = 'new'
-
+                today_field = 'newToday'
             elif last_ivl < 0:
-                # Card was in a LEARNING step — restore to learning queue.
-                # Setting due=0 (Unix epoch, year 1970) makes this the most
-                # overdue learning card possible, guaranteeing it will be
-                # returned first by get_queued_cards() ahead of all other
-                # learning, new, and review cards.
-                card.type = 1
-                card.queue = 1
-                card.ivl = 0
-                card.due = 0
-                card.factor = prior_factor
-                card.flush()
-                restored_state = 'learning'
-
+                today_field = 'lrnToday'
             else:
-                # Card was a mature REVIEW card — restore to review queue.
-                # Setting due=today-999999 (≈2700 years ago) makes this the
-                # most overdue review card possible, placing it ahead of all
-                # other review cards in the queue. Only intraday learning cards
-                # (typically 0–3) can appear before it, so answerCard's
-                # batch-peek approach suspends at most a handful of blockers.
-                card.type = 2
-                card.queue = 2
-                card.ivl = last_ivl
-                card.due = today - 999999
-                card.factor = prior_factor
-                card.flush()
-                restored_state = 'review'
+                today_field = 'revToday'
 
-            # Force the scheduler to recount new/learn/review from the
-            # database. Without this the in-memory counts stay stale.
-            collection.sched.reset()
+            today_entry = deck.get(today_field)
+            if today_entry and today_entry[0] == today and today_entry[1] > 0:
+                deck[today_field][1] -= 1
+                collection.decks.save(deck)
 
-            collection.autosave()
-            self.stopEditing()
+        # ----------------------------------------------------------------
+        # Restore the card's scheduling state
+        # ----------------------------------------------------------------
+        if last_ivl == 0:
+            # Card was NEW before this answer.
+            # forgetCards() resets to queue=0 via Anki's proper pipeline.
+            collection.sched.forgetCards([cardId])
 
-            return {
-                'cardId': cardId,
-                'restoredState': restored_state,
-                'restoredInterval': last_ivl
-            }
+            # forgetCards() assigns due = card.ord (its position number),
+            # which buries it deep in the new queue. Re-fetch and set due=0
+            # to put it at the FRONT of the new queue so it shows up next.
+            card = collection.getCard(cardId)
+            card.due = 0
+            card.flush()
+            restored_state = 'new'
 
-        except Exception as e:
-            self.stopEditing()
-            raise e
+        elif last_ivl < 0:
+            # Card was in a LEARNING step — restore to learning queue.
+            # Setting due=0 (Unix epoch, year 1970) makes this the most
+            # overdue learning card possible, guaranteeing it will be
+            # returned first by get_queued_cards() ahead of all other
+            # learning, new, and review cards.
+            card.type = 1
+            card.queue = 1
+            card.ivl = 0
+            card.due = 0
+            card.factor = prior_factor
+            card.flush()
+            restored_state = 'learning'
+
+        else:
+            # Card was a mature REVIEW card — restore to review queue.
+            # Setting due=today-999999 (≈2700 years ago) makes this the
+            # most overdue review card possible, placing it ahead of all
+            # other review cards in the queue. Only intraday learning cards
+            # (typically 0–3) can appear before it, so answerCard's
+            # batch-peek approach suspends at most a handful of blockers.
+            card.type = 2
+            card.queue = 2
+            card.ivl = last_ivl
+            card.due = today - 999999
+            card.factor = prior_factor
+            card.flush()
+            restored_state = 'review'
+
+        # Force the scheduler to recount new/learn/review from the
+        # database. Without this the in-memory counts stay stale.
+        collection.sched.reset()
+
+        # Optional desktop-GUI repaint. undoAnswerCard does raw DB writes that
+        # don't fire the op-framework hooks, so when the Tools-menu toggle
+        # "Global Edge: Refresh GUI after API writes" is on (for debugging while
+        # watching the Anki GUI) this is the only thing that refreshes the
+        # reviewer/deck list. mw.reset() is the modern refresh — no requireReset
+        # stack trace. Default off and guarded, so the headless server pays nothing.
+        if getattr(self.bridge, 'guiRefreshAfterApiWrites', False):
+            try:
+                self.bridge.window().reset()
+            except Exception:
+                pass
+
+        return {
+            'cardId': cardId,
+            'restoredState': restored_state,
+            'restoredInterval': last_ivl
+        }
 
     def getDeckReviewsByDay(self, deckName, days=14):
         """

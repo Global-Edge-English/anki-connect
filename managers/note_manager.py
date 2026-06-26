@@ -25,6 +25,10 @@ class NoteManager:
         """Stop editing session"""
         self.bridge.stopEditing()
 
+    def refreshGuiIfEnabled(self):
+        """Menu-gated modern GUI refresh (delegates to the bridge)."""
+        self.bridge.refreshGuiIfEnabled()
+
     # Model (Note Type) Management
     
     def createModel(self, modelName, fields, templates, css=""):
@@ -51,38 +55,34 @@ class NoteManager:
         if collection.models.byName(modelName):
             raise Exception(f"Model '{modelName}' already exists")
         
-        self.startEditing()
-        
-        try:
-            # Create new model
-            model = collection.models.new(modelName)
-            
-            # Add fields
-            for fieldName in fields:
-                field = collection.models.newField(fieldName)
-                collection.models.addField(model, field)
-            
-            # Add templates
-            for templateData in templates:
-                template = collection.models.newTemplate(templateData['name'])
-                template['qfmt'] = templateData['qfmt']  # Question format
-                template['afmt'] = templateData['afmt']  # Answer format
-                collection.models.addTemplate(model, template)
-            
-            # Set CSS if provided
-            if css:
-                model['css'] = css
-            
-            # Save the model
-            collection.models.add(model)
-            collection.models.save(model)
-            
-            self.stopEditing()
-            return model['id']
-            
-        except Exception as e:
-            self.stopEditing()
-            raise e
+        # No startEditing()/stopEditing() wrapper: requireReset() prints a stack
+        # trace + forces a full UI reset on every call. models.add/save persist
+        # directly; refresh the GUI only when the menu toggle is on.
+        # Create new model
+        model = collection.models.new(modelName)
+
+        # Add fields
+        for fieldName in fields:
+            field = collection.models.newField(fieldName)
+            collection.models.addField(model, field)
+
+        # Add templates
+        for templateData in templates:
+            template = collection.models.newTemplate(templateData['name'])
+            template['qfmt'] = templateData['qfmt']  # Question format
+            template['afmt'] = templateData['afmt']  # Answer format
+            collection.models.addTemplate(model, template)
+
+        # Set CSS if provided
+        if css:
+            model['css'] = css
+
+        # Save the model
+        collection.models.add(model)
+        collection.models.save(model)
+
+        self.refreshGuiIfEnabled()
+        return model['id']
 
     def updateModel(self, modelId, modelName=None, fields=None, templates=None, css=None):
         """
@@ -109,8 +109,9 @@ class NoteManager:
         if model is None:
             raise Exception(f"Model with ID '{modelId}' does not exist")
         
-        self.startEditing()
-        
+        # No startEditing()/stopEditing() wrapper: requireReset() prints a stack
+        # trace + forces a full UI reset on every call. models.save() persists
+        # directly; GUI refresh is gated on the menu toggle (see the return path).
         try:
             # Update model name if provided
             if modelName is not None:
@@ -196,13 +197,12 @@ class NoteManager:
             
             # Save the model
             collection.models.save(model)
-            
-            self.stopEditing()
+
+            self.refreshGuiIfEnabled()
             return True
-            
-        except Exception as e:
-            self.stopEditing()
-            raise e
+
+        except Exception:
+            raise
 
     def deleteModel(self, modelId):
         """
@@ -259,10 +259,9 @@ class NoteManager:
         if collection.decks.byName(deckName):
             raise Exception(f"Deck '{deckName}' already exists")
         
-        self.startEditing()
         deckId = collection.decks.id(deckName)
-        self.stopEditing()
-        
+        self.refreshGuiIfEnabled()
+
         return deckId
 
     def deleteDeck(self, deckName, deleteCards=False):
@@ -284,18 +283,13 @@ class NoteManager:
         if deck is None:
             raise Exception(f"Deck '{deckName}' does not exist")
         
-        self.startEditing()
-        
-        try:
-            # Use Anki's backend remove_decks method
-            from anki.decks import DeckId
-            collection.decks.remove([DeckId(deck['id'])])
-            
-            self.stopEditing()
-            return True
-        except Exception as e:
-            self.stopEditing()
-            raise e
+        # No startEditing()/stopEditing(): requireReset() printed a stack trace
+        # + full UI reset per call. remove() persists directly; refresh the GUI
+        # only when the menu toggle is on.
+        from anki.decks import DeckId
+        collection.decks.remove([DeckId(deck['id'])])
+        self.refreshGuiIfEnabled()
+        return True
 
     def renameDeck(self, oldName, newName):
         """

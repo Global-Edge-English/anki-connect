@@ -72,6 +72,7 @@ WRITE_ALLOWED = {
 # server-side, leaving the request unanswered (looks like a client hang).
 SETUP_READ = {
     "version", "modelNamesAndIds", "deckNamesAndIds", "notesInfo",
+    "gcStats",  # read-mostly GC diagnostic; collect=True frees cycles, not user data
 }
 # Any string naming a studyplan deck must belong to the probe deck - full stop.
 FOREIGN_DECK_PREFIXES = ("staging_", "production_", "ge-english_", "local_")
@@ -149,6 +150,18 @@ def result_of(reply):
 
 def error_of(reply):
     return reply.get("error") if isinstance(reply, dict) else None
+
+
+def gc_snapshot(client, collect=False, top_types=0, saveall=False):
+    """Fetch the server-side GC snapshot via the gcStats action. Returns the
+    result dict (objects, garbage, enabled, and when collect=True: collected,
+    objectsAfter; when top_types>0: topTypes; when saveall: garbageTypes - the
+    true type histogram of the collected cycle objects) or None if the add-on
+    predates gcStats."""
+    res = result_of(client.call("gcStats", {"collect": collect,
+                                            "topTypes": top_types,
+                                            "saveall": saveall}))
+    return res if isinstance(res, dict) else None
 
 
 # --------------------------------------------------------------------------- #
@@ -387,16 +400,28 @@ def build_steps(client, ctx, probe_deck, audio_url, package_url):
     return steps
 
 
-def run_probe(label, step, n, settle, threshold):
-    """Run one state-neutral step N times; report anon delta. Captures (but
-    keeps going past) per-iteration errors so a single bad call doesn't strand
-    the run - the error is surfaced in the row."""
+def run_probe(client, label, step, n, settle, threshold, top_types=0):
+    """Run one state-neutral step N times and measure the PER-CALL cycle leak.
+
+    Anki keeps gc.disable() on, so any per-request reference cycle is never
+    freed. We isolate and measure that directly:
+      1. gcStats(collect=True): free cycles left by the previous endpoint and
+         take a clean object-count baseline.
+      2. run the step N times.
+      3. gcStats(collect=True) again: 'collected' is how many cycle objects
+         this endpoint created - exactly what leaks forever under gc.disable().
+    The headline is collected/N (objects leaked per call); a clean endpoint
+    sits at ~0. anon MB is kept as a noisy secondary cross-check only. Errors
+    are captured (not fatal) so one bad call doesn't strand the run.
+    """
     err = None
     try:
         step()  # warm-up + first error surface
     except Exception as e:
         err = str(e)
-    before = read_anon()
+
+    base = gc_snapshot(client, collect=True)
+    before_anon = read_anon()
     t0 = time.time()
     next_report = t0 + 0.5
     for i in range(1, n + 1):
@@ -407,25 +432,38 @@ def run_probe(label, step, n, settle, threshold):
                 err = str(e)
         now = time.time()
         if now >= next_report:
-            cur = read_anon()
-            d = (cur - before) / (1024 * 1024) if (cur is not None and before is not None) else float("nan")
             rate = i / (now - t0) if now > t0 else 0
-            sys.stdout.write(f"\r  {label:30s} {i:>5}/{n}  {rate:5.0f}/s  \u0394{d:+7.1f}MB   ")
+            sys.stdout.write(f"\r  {label:30s} {i:>5}/{n}  {rate:5.0f}/s   ")
             sys.stdout.flush()
             next_report = now + 0.5
     time.sleep(settle)
-    after = read_anon()
-    delta = (after - before) if (before is not None and after is not None) else None
+
+    after = gc_snapshot(client, collect=True, top_types=top_types,
+                        saveall=(top_types > 0))
+    after_anon = read_anon()
     elapsed = time.time() - t0
-    if delta is None:
-        line = f"\r  {label:30s} {n}/{n}  {elapsed:4.0f}s   n/a (no cgroup)"
-    else:
-        mb = delta / (1024 * 1024)
-        tag = "  <-- LEAK" if mb > threshold else ""
-        errtag = f"  [err: {err}]" if err else ""
-        line = f"\r  {label:30s} {n}/{n}  {elapsed:4.0f}s   {mb:+8.1f} MB{tag}{errtag}"
-    print(line + " " * 8, flush=True)
-    return label, delta, err
+
+    if base is None or after is None:
+        print(f"\r  {label:30s} {n}/{n}  {elapsed:4.0f}s   "
+              f"n/a (no gcStats - rebuild add-on)" + " " * 6, flush=True)
+        return label, None, None, err
+
+    leaked = int(after.get("collected", 0))   # cycle objects from this burst
+    per_call = leaked / n if n else 0.0
+    anon_mb = ((after_anon - before_anon) / (1024 * 1024)
+               if (after_anon is not None and before_anon is not None) else None)
+    tag = "  <-- LEAK" if per_call > threshold else ""
+    anon_txt = f"  anon{anon_mb:+.0f}MB" if anon_mb is not None else ""
+    errtag = f"  [err: {err}]" if err else ""
+    print(f"\r  {label:30s} {n}/{n}  {elapsed:4.0f}s   {per_call:6.2f} obj/call "
+          f"({leaked:+d}/{n}){anon_txt}{tag}{errtag}" + " " * 4, flush=True)
+    if tag and after.get("garbageTypes"):
+        top = ", ".join(f"{name}:{cnt}" for name, cnt in after["garbageTypes"][:12])
+        print(f"      leaked-object types: {top}", flush=True)
+    elif tag and top_types and after.get("topTypes"):
+        top = ", ".join(f"{name}:{cnt}" for name, cnt in after["topTypes"][:8])
+        print(f"      top types after burst (heap, not leak): {top}", flush=True)
+    return label, per_call, leaked, err
 
 
 def main():
@@ -434,7 +472,8 @@ def main():
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--n", type=int, default=3000, help="iterations per endpoint")
     ap.add_argument("--env-prefix", default="staging_", help="probe deck is created under this prefix")
-    ap.add_argument("--threshold", type=float, default=20.0, help="MB over which an endpoint is flagged LEAK")
+    ap.add_argument("--threshold", type=float, default=1.0, help="objects/call (gc cycle objects) over which an endpoint is flagged LEAK")
+    ap.add_argument("--top-types", type=int, default=0, dest="top_types", help="if >0, print the top-N object types after the burst for flagged endpoints")
     ap.add_argument("--settle", type=float, default=0.5, help="seconds to wait after a burst before reading anon")
     ap.add_argument("--only", default=None, help="comma-separated action/label substrings to limit the run")
     ap.add_argument("--audio", action="store_true", help="include audio path (self-hosts a tiny mp3 on localhost)")
@@ -454,6 +493,9 @@ def main():
     print(f"ISOLATED probe deck = {probe_deck!r}  (+::Text/::Audio), model = "
           f"{PROBE_MODEL!r}\nguard: refuses any payload naming a non-probe "
           f"staging_/production_/ge-english_/local_ deck.\n", flush=True)
+    if gc_snapshot(client) is None:
+        print("WARN: add-on has no gcStats action - rebuild/redeploy the updated "
+              "AnkiConnect.py. Rows will read 'n/a (no gcStats)'.", file=sys.stderr)
 
     audio_url = start_audio_server() if args.audio else None
     if audio_url:
@@ -464,7 +506,10 @@ def main():
         ctx = setup(client, probe_deck, args.audio)
         model_id = ctx["model_id"]
         print(f"seeded: note={ctx['seed_note']} card={ctx['seed_card']}  "
-              f"N={args.n}/endpoint  threshold={args.threshold}MB\n", flush=True)
+              f"N={args.n}/endpoint  threshold={args.threshold} obj/call\n"
+              f"metric: objects leaked per call (gc cycle objects, collected "
+              f"between endpoints); anon MB is a noisy cross-check only.\n",
+              flush=True)
 
         steps = build_steps(client, ctx, probe_deck, audio_url, args.package_url)
         if args.only:
@@ -473,17 +518,20 @@ def main():
 
         results = []
         for label, _action, step in steps:
-            results.append(run_probe(label, step, args.n, args.settle, args.threshold))
+            results.append(run_probe(client, label, step, args.n, args.settle,
+                                     args.threshold, args.top_types))
     finally:
         teardown(client, probe_deck, model_id)
 
-    print("\n=== summary (worst first) ===", flush=True)
-    for label, delta, err in sorted(results, key=lambda r: (r[1] if r[1] is not None else float("-inf")), reverse=True):
-        if delta is None:
-            print(f"  {label:30s}   n/a")
+    print("\n=== summary (worst first, objects leaked per call) ===", flush=True)
+    for label, per_call, leaked, err in sorted(
+            results, key=lambda r: (r[1] if r[1] is not None else float("-inf")),
+            reverse=True):
+        if per_call is None:
+            print(f"  {label:30s}   n/a (no gcStats)")
             continue
-        mb = delta / (1024 * 1024)
-        print(f"  {label:30s} {mb:+8.1f} MB{'  LEAK' if mb > args.threshold else ''}"
+        flag = "  LEAK" if per_call > args.threshold else ""
+        print(f"  {label:30s} {per_call:6.2f} obj/call  ({leaked:+d}/{args.n}){flag}"
               f"{f'   [err: {err}]' if err else ''}")
 
 
