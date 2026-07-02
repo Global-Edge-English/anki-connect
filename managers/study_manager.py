@@ -26,6 +26,10 @@ class StudyManager:
         """Stop editing session"""
         self.bridge.stopEditing()
 
+    def refreshGuiIfEnabled(self):
+        """Menu-gated modern GUI refresh (delegates to the bridge)."""
+        self.bridge.refreshGuiIfEnabled()
+
     def getNextReviewCard(self, deckName=None, needRender=False):
         """
         Get the next card due for review from a specific deck or all decks.

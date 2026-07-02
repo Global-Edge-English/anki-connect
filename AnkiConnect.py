@@ -68,7 +68,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.1.16"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.1.17"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = int(os.getenv('ANKICONNECT_TICK_INTERVAL_MS', '5'))
 
 # Persisted-config key for the Tools-menu "refresh GUI after API writes" toggle.
