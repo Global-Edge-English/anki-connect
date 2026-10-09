@@ -68,7 +68,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.1.17"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.1.18"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = int(os.getenv('ANKICONNECT_TICK_INTERVAL_MS', '5'))
 
 # Persisted-config key for the Tools-menu "refresh GUI after API writes" toggle.
@@ -271,7 +271,7 @@ class AnkiBridge:
             return
 
         # Get the target deck
-        deck = collection.decks.byName(params.deckName)
+        deck = collection.decks.by_name(params.deckName)
         if deck is None:
             return
 
@@ -371,7 +371,7 @@ class AnkiBridge:
         
         # Get the note
         try:
-            note = collection.getNote(note_id)
+            note = collection.get_note(note_id)
         except Exception as e:
             raise Exception(f"Failed to get note with ID {note_id}: {str(e)}")
         
@@ -513,7 +513,7 @@ class AnkiBridge:
         if collection is None:
             return False
 
-        card = collection.getCard(cardId)
+        card = collection.get_card(cardId)
         if card is None:
             raise Exception(f"Card with ID '{cardId}' does not exist")
 
@@ -533,7 +533,7 @@ class AnkiBridge:
         if collection is None:
             return False
 
-        card = collection.getCard(cardId)
+        card = collection.get_card(cardId)
         if card is None:
             raise Exception(f"Card with ID '{cardId}' does not exist")
 
@@ -658,7 +658,7 @@ class AnkiBridge:
 
         modelNames = self.modelNames()
         for model in modelNames:
-            mid = self.collection().models.byName(model)['id']
+            mid = self.collection().models.by_name(model)['id']
             mid = int(mid)  # sometimes Anki stores the ID as a string
             models[model] = mid
 
@@ -864,8 +864,8 @@ class AnkiBridge:
         result = []
         for nid in notes:
             try:
-                note = self.collection().getNote(nid)
-                model = note.model()
+                note = self.collection().get_note(nid)
+                model = note.note_type()
 
                 fields = {}
                 for info in model['flds']:
@@ -1093,9 +1093,9 @@ class AnkiBridge:
             
             # Validate model exists
             model_name = params.get('modelName')
-            model = collection.models.byName(model_name)
+            model = collection.models.by_name(model_name)
             if model is None:
-                available_models = collection.models.allNames()
+                available_models = [n.name for n in collection.models.all_names_and_ids()]
                 raise Exception(f"Model '{model_name}' not found. Available models: {', '.join(available_models)}")
             
             # Check if model has Audio1 field
@@ -1105,9 +1105,9 @@ class AnkiBridge:
             
             # Validate deck exists
             deck_name = params.get('deckName')
-            deck = collection.decks.byName(deck_name)
+            deck = collection.decks.by_name(deck_name)
             if deck is None:
-                available_decks = collection.decks.allNames()
+                available_decks = [d.name for d in collection.decks.all_names_and_ids()]
                 raise Exception(f"Deck '{deck_name}' not found. Available decks: {', '.join(available_decks[:10])}...")
             
             # Validate audioFile
@@ -1162,7 +1162,7 @@ class AnkiBridge:
                 raise Exception("Note parameters validation failed. Check deckName, modelName, fields, and tags are all valid strings.")
             
             # Create note object
-            model = collection.models.byName(model_name)
+            model = collection.models.by_name(model_name)
             note = anki.notes.Note(collection, model)
             note.tags = params.get('tags', [])
             
@@ -1221,10 +1221,10 @@ class AnkiBridge:
             # If parentDeck is specified, ensure it exists
             if parentDeck:
                 # Create the parent deck if it doesn't exist
-                parent_deck = collection.decks.byName(parentDeck)
+                parent_deck = collection.decks.by_name(parentDeck)
                 if parent_deck is None:
                     collection.decks.id(parentDeck)  # This creates the deck
-                    parent_deck = collection.decks.byName(parentDeck)
+                    parent_deck = collection.decks.by_name(parentDeck)
             
             # Download file
             try:
@@ -1277,7 +1277,7 @@ class AnkiBridge:
                 from anki import import_export_pb2
                 
                 # Get deck names and card IDs before import to track what was imported
-                decks_before = set(collection.decks.allNames())
+                decks_before = {d.name for d in collection.decks.all_names_and_ids()}
                 cards_before = set(collection.db.list('select id from cards'))
                 
                 # Create import options
@@ -1330,7 +1330,7 @@ class AnkiBridge:
                     
                     if new_card_ids:
                         # Get new decks that were created by the import
-                        decks_after = set(collection.decks.allNames())
+                        decks_after = {d.name for d in collection.decks.all_names_and_ids()}
                         new_decks = decks_after - decks_before
                         
                         # Determine the subdeck name
@@ -1362,9 +1362,9 @@ class AnkiBridge:
                         # Delete the temporary imported decks (cards are already moved)
                         for temp_deck_name in new_decks:
                             try:
-                                temp_deck = collection.decks.byName(temp_deck_name)
+                                temp_deck = collection.decks.by_name(temp_deck_name)
                                 if temp_deck:
-                                    collection.decks.rem(temp_deck['id'], cardsToo=False)
+                                    collection.decks.remove([temp_deck['id']])
                             except:
                                 pass
                         
@@ -2003,6 +2003,10 @@ class AnkiConnect:
     @webApi()
     def deleteDeck(self, deckName, deleteCards=False):
         return NoteManager(self.anki).deleteDeck(deckName, deleteCards)
+
+    @webApi()
+    def resetDecks(self, ownerDeck, deckNames, keepDeckNames=None):
+        return NoteManager(self.anki).resetDecks(ownerDeck, deckNames, keepDeckNames)
 
     @webApi()
     def renameDeck(self, oldName, newName):

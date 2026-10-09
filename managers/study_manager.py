@@ -53,7 +53,7 @@ class StudyManager:
         # current_deck_id to the collection config — guard so polling
         # clients don't trigger a DB write on every call.
         if deckName:
-            deck = collection.decks.byName(deckName)
+            deck = collection.decks.by_name(deckName)
             if deck is None:
                 raise Exception(f"Deck '{deckName}' does not exist")
             if collection.decks.selected() != deck['id']:
@@ -97,7 +97,7 @@ class StudyManager:
             )
 
         # Get card information
-        model = card.model()
+        model = card.note_type()
         template = card.template()
 
         raw_flds = collection.db.scalar("SELECT flds FROM notes WHERE id = ?", card.nid).split("\x1f")
@@ -539,7 +539,7 @@ class StudyManager:
             raise Exception("Collection not available")
         
         # Get the deck
-        deck = collection.decks.byName(deckName)
+        deck = collection.decks.by_name(deckName)
         if deck is None:
             raise Exception(f"Deck '{deckName}' does not exist")
         
@@ -556,28 +556,28 @@ class StudyManager:
         # No startEditing()/stopEditing() wrapper (requireReset spam + full UI
         # reset). decks.save() persists directly; GUI refresh gated on the toggle.
         try:
-            # Check if this config is shared by other decks
-            decks_using_config = []
-            for did, d in collection.decks.decks.items():
-                if d.get('conf') == current_config_id and did != str(deck_id):
-                    decks_using_config.append(d['name'])
-            
+            # Check if this config is shared by other decks. decks_using_config()
+            # is Anki's own helper; it returns int DeckIds, so compare against the
+            # int deck_id (the old decks.decks scan yielded string keys).
+            current_config = collection.decks.get_config(current_config_id)
+            is_shared = current_config is not None and any(
+                did != deck_id for did in collection.decks.decks_using_config(current_config)
+            )
+
             # If config is shared, clone it for this deck only
-            if len(decks_using_config) > 0:
-                # Clone the current config
-                current_config = collection.decks.getConf(current_config_id)
+            if is_shared:
                 new_config_name = f"{deckName} Options"
-                new_config_id = collection.decks.confId(new_config_name, current_config)
+                new_config_id = collection.decks.add_config_returning_id(new_config_name, current_config)
                 
                 # Assign the new config to this deck
                 deck['conf'] = new_config_id
                 collection.decks.save(deck)
                 
                 # Get the newly created config
-                config = collection.decks.getConf(new_config_id)
+                config = collection.decks.get_config(new_config_id)
             else:
                 # Config is not shared, safe to modify directly
-                config = collection.decks.confForDid(deck_id)
+                config = collection.decks.config_dict_for_deck_id(deck_id)
             
             if config is None:
                 raise Exception(f"Could not get configuration for deck '{deckName}'")
@@ -608,8 +608,8 @@ class StudyManager:
                 'configName': config['name'],
                 'newCardsPerDay': config['new']['perDay'],
                 'reviewsPerDay': config['rev']['perDay'],
-                'wasShared': len(decks_using_config) > 0,
-                'createdNewConfig': len(decks_using_config) > 0
+                'wasShared': is_shared,
+                'createdNewConfig': is_shared
             }
             
             # If this is a child deck, update parent deck's limits to be sum of all children
@@ -655,7 +655,7 @@ class StudyManager:
             raise Exception("Collection not available")
         
         # Get the deck
-        deck = collection.decks.byName(deckName)
+        deck = collection.decks.by_name(deckName)
         if deck is None:
             raise Exception(f"Deck '{deckName}' does not exist")
         
@@ -712,7 +712,7 @@ class StudyManager:
             raise Exception("Collection not available")
         
         # Verify source deck exists
-        source_deck = collection.decks.byName(deckName)
+        source_deck = collection.decks.by_name(deckName)
         if source_deck is None:
             raise Exception(f"Deck '{deckName}' does not exist")
         
@@ -736,7 +736,7 @@ class StudyManager:
             
             # Get the created filtered deck (Anki names it "Custom Study Session")
             filtered_deck_name = "Custom Study Session"
-            filtered_deck = collection.decks.byName(filtered_deck_name)
+            filtered_deck = collection.decks.by_name(filtered_deck_name)
             
             if filtered_deck is None:
                 raise Exception("Failed to create custom study deck")
@@ -871,14 +871,14 @@ class StudyManager:
 
         # Verify card exists
         try:
-            card = collection.getCard(cardId)
+            card = collection.get_card(cardId)
         except Exception:
             raise Exception(f"Card with ID '{cardId}' does not exist")
 
         # If deckName provided, validate the card belongs to that deck or a subdeck
         if deckName:
             # Verify the parent deck exists
-            parent_deck = collection.decks.byName(deckName)
+            parent_deck = collection.decks.by_name(deckName)
             if parent_deck is None:
                 raise Exception(f"Deck '{deckName}' does not exist")
 
@@ -959,7 +959,7 @@ class StudyManager:
             # forgetCards() assigns due = card.ord (its position number),
             # which buries it deep in the new queue. Re-fetch and set due=0
             # to put it at the FRONT of the new queue so it shows up next.
-            card = collection.getCard(cardId)
+            card = collection.get_card(cardId)
             card.due = 0
             card.flush()
             restored_state = 'new'
@@ -1154,7 +1154,7 @@ class StudyManager:
         child_did_to_suffix = {}  # did -> child deck suffix e.g. "Text", "Audio"
         all_dids = set()
         for deckName in deckNames:
-            deck = collection.decks.byName(deckName)
+            deck = collection.decks.by_name(deckName)
             if deck is None:
                 continue
             descendant_dids = collection.decks.deck_and_child_ids(deck['id'])

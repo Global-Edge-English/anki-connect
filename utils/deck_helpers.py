@@ -21,22 +21,22 @@ def get_direct_child_decks(collection, parent_name):
     """
     if collection is None:
         return []
-    
+
+    # decks.children() is a cached backend RPC returning (name, id) for every
+    # descendant. Beats scanning collection.decks.decks, which materialises
+    # every deck dict on each call.
+    parent_id = collection.decks.id_for_name(parent_name)
+    if parent_id is None:
+        return []
+
     children = []
     prefix = parent_name + '::'
-    
-    for deck_id, deck in collection.decks.decks.items():
-        deck_name = deck['name']
-        
-        # Check if this deck is a direct child
-        if deck_name.startswith(prefix):
-            # Get the part after the parent prefix
-            remainder = deck_name[len(prefix):]
-            
-            # Only include if there are no more '::' (direct child only)
-            if '::' not in remainder:
-                children.append(deck_name)
-    
+
+    for deck_name, _did in collection.decks.children(parent_id):
+        # Only include if there are no more '::' (direct child only)
+        if '::' not in deck_name[len(prefix):]:
+            children.append(deck_name)
+
     return children
 
 
@@ -54,12 +54,12 @@ def get_deck_limits(collection, deck_name):
     if collection is None:
         return (0, 0)
     
-    deck = collection.decks.byName(deck_name)
+    deck = collection.decks.by_name(deck_name)
     if deck is None:
         return (0, 0)
     
     # Get the deck's configuration
-    config = collection.decks.confForDid(deck['id'])
+    config = collection.decks.config_dict_for_deck_id(deck['id'])
     if config is None:
         return (0, 0)
     
@@ -83,7 +83,7 @@ def update_parent_deck_silent(collection, parent_name, new_cards_total, reviews_
         return
     
     # Get the parent deck
-    parent_deck = collection.decks.byName(parent_name)
+    parent_deck = collection.decks.by_name(parent_name)
     if parent_deck is None:
         return
     
@@ -91,27 +91,28 @@ def update_parent_deck_silent(collection, parent_name, new_cards_total, reviews_
     current_config_id = parent_deck.get('conf', 1)
     
     try:
-        # Check if this config is shared by other decks
-        decks_using_config = []
-        for did, d in collection.decks.decks.items():
-            if d.get('conf') == current_config_id and did != str(parent_id):
-                decks_using_config.append(d['name'])
-        
+        # Check if this config is shared by other decks. decks_using_config()
+        # is Anki's own helper; it returns int DeckIds, so compare against the
+        # int parent_id (the old decks.decks scan yielded string keys).
+        current_config = collection.decks.get_config(current_config_id)
+        is_shared = current_config is not None and any(
+            did != parent_id for did in collection.decks.decks_using_config(current_config)
+        )
+
         # If config is shared, clone it for this deck only
-        if len(decks_using_config) > 0:
-            current_config = collection.decks.getConf(current_config_id)
+        if is_shared:
             new_config_name = f"{parent_name} Options"
-            new_config_id = collection.decks.confId(new_config_name, current_config)
+            new_config_id = collection.decks.add_config_returning_id(new_config_name, current_config)
             
             # Assign the new config to this deck
             parent_deck['conf'] = new_config_id
             collection.decks.save(parent_deck)
             
             # Get the newly created config
-            config = collection.decks.getConf(new_config_id)
+            config = collection.decks.get_config(new_config_id)
         else:
             # Config is not shared, safe to modify directly
-            config = collection.decks.confForDid(parent_id)
+            config = collection.decks.config_dict_for_deck_id(parent_id)
         
         if config is None:
             return

@@ -52,7 +52,7 @@ class NoteManager:
             return None
         
         # Check if model already exists
-        if collection.models.byName(modelName):
+        if collection.models.by_name(modelName):
             raise Exception(f"Model '{modelName}' already exists")
         
         # No startEditing()/stopEditing() wrapper: requireReset() prints a stack
@@ -63,12 +63,12 @@ class NoteManager:
 
         # Add fields
         for fieldName in fields:
-            field = collection.models.newField(fieldName)
+            field = collection.models.new_field(fieldName)
             collection.models.addField(model, field)
 
         # Add templates
         for templateData in templates:
-            template = collection.models.newTemplate(templateData['name'])
+            template = collection.models.new_template(templateData['name'])
             template['qfmt'] = templateData['qfmt']  # Question format
             template['afmt'] = templateData['afmt']  # Answer format
             collection.models.addTemplate(model, template)
@@ -116,7 +116,7 @@ class NoteManager:
             # Update model name if provided
             if modelName is not None:
                 # Check if new name already exists (and it's not the same model)
-                existing = collection.models.byName(modelName)
+                existing = collection.models.by_name(modelName)
                 if existing and existing['id'] != modelId:
                     raise Exception(f"Model '{modelName}' already exists")
                 model['name'] = modelName
@@ -139,7 +139,7 @@ class NoteManager:
                 
                 # Add new fields
                 for fieldName in fields_to_add:
-                    field = collection.models.newField(fieldName)
+                    field = collection.models.new_field(fieldName)
                     collection.models.addField(model, field)
                 
                 # Reorder fields to match the desired order
@@ -186,7 +186,7 @@ class NoteManager:
                 
                 # Add new templates
                 for templateData in templates_to_add:
-                    template = collection.models.newTemplate(templateData['name'])
+                    template = collection.models.new_template(templateData['name'])
                     template['qfmt'] = templateData['qfmt']
                     template['afmt'] = templateData['afmt']
                     collection.models.addTemplate(model, template)
@@ -256,7 +256,7 @@ class NoteManager:
             return None
         
         # Check if deck already exists
-        if collection.decks.byName(deckName):
+        if collection.decks.by_name(deckName):
             raise Exception(f"Deck '{deckName}' already exists")
         
         deckId = collection.decks.id(deckName)
@@ -279,7 +279,7 @@ class NoteManager:
         if collection is None:
             return False
             
-        deck = collection.decks.byName(deckName)
+        deck = collection.decks.by_name(deckName)
         if deck is None:
             raise Exception(f"Deck '{deckName}' does not exist")
         
@@ -290,6 +290,186 @@ class NoteManager:
         collection.decks.remove([DeckId(deck['id'])])
         self.refreshGuiIfEnabled()
         return True
+
+    def resetDecks(self, ownerDeck, deckNames, keepDeckNames=None):
+        """
+        Reset some or all of one student's decks.
+
+        Deletes every note with a card in the target decks (or their subdecks).
+        Target decks listed in keepDeckNames survive empty, keeping their deck
+        ids and deck options; their non-kept subdecks are removed. Other target
+        decks are removed together with their subdecks. Every filtered (custom
+        study) deck under ownerDeck is removed first, whatever the targets.
+
+        A kept deck below a removed deck is removed with it, so keep the whole
+        path down to it (e.g. the root as well as 'root::Text').
+
+        Safe to retry: a second call finds nothing left to delete or remove.
+
+        Args:
+            ownerDeck (str): The student's top-level deck (no '::')
+            deckNames (list): Decks to reset: ownerDeck itself and/or its subdecks
+            keepDeckNames (list, optional): Decks to empty but not remove
+
+        Returns:
+            dict: {
+                'notesDeleted': int,
+                'deletedNoteIds': [int],
+                'decksRemoved': [str],  # includes subdecks and filtered decks
+                'missing': [str]  # entries of deckNames that don't exist
+            }
+
+        Raises:
+            Exception: If an argument is malformed or a deck name is outside ownerDeck
+        """
+        collection = self.collection()
+        if collection is None:
+            raise Exception("Collection not available")
+
+        if not isinstance(ownerDeck, str) or not ownerDeck.strip() or '::' in ownerDeck:
+            raise Exception("ownerDeck must be a top-level deck name")
+        if not isinstance(deckNames, list) or not deckNames:
+            raise Exception("deckNames must be a non-empty list")
+        if keepDeckNames is None:
+            keepDeckNames = []
+        if not isinstance(keepDeckNames, list):
+            raise Exception("keepDeckNames must be a list")
+
+        # Anki deck names are case-insensitive, so every name comparison below
+        # is done on .lower().
+        owner_lower = ownerDeck.lower()
+        owner_prefix = owner_lower + '::'
+        for name in deckNames + keepDeckNames:
+            if not isinstance(name, str):
+                raise Exception("Deck names must be strings")
+            name_lower = name.lower()
+            if name_lower != owner_lower and not name_lower.startswith(owner_prefix):
+                raise Exception(f"Deck '{name}' does not belong to deck '{ownerDeck}'")
+
+        # A missing owner means there is nothing to reset. Don't raise
+        # "does not exist": the API treats that as a broken deck and repairs.
+        owner = collection.decks.by_name(ownerDeck)
+        if owner is None:
+            return {
+                'notesDeleted': 0,
+                'deletedNoteIds': [],
+                'decksRemoved': [],
+                'missing': list(deckNames),
+            }
+        owner_id = int(owner['id'])
+
+        # Anki runs with the cyclic GC disabled (see CLAUDE.md), so this method
+        # only keeps plain ints and strings: each deck dict is read and dropped
+        # straight away, and no nested function walks the tree.
+        from anki.decks import DeckId
+
+        # Remove filtered decks first. A card in a filtered deck has `did` set
+        # to the filtered deck and its home deck in `odid`; removing the
+        # filtered deck sends the card home. Doing it up front puts every card
+        # back in its home deck before the notes are picked by `did`, cards
+        # from decks that aren't being reset simply go home, and no filtered
+        # deck is left to return cards into a home deck removed below.
+        decks_removed = []
+        removed_lower = set()
+        dyn_ids = []
+        for name, did in collection.decks.children(owner_id):
+            deck = collection.decks.get(did, default=False)
+            if deck is not None and deck.get('dyn'):
+                dyn_ids.append(int(did))
+                decks_removed.append(name)
+                removed_lower.add(name.lower())
+        if dyn_ids:
+            collection.decks.remove([DeckId(did) for did in dyn_ids])
+
+        # Resolve the targets to plain (id, name) pairs. A target that was a
+        # filtered deck is already gone, so it isn't reported as missing.
+        targets = []
+        target_ids = set()
+        missing = []
+        for name in deckNames:
+            if name.lower() in removed_lower:
+                continue
+            deck = collection.decks.by_name(name)
+            if deck is None:
+                missing.append(name)
+                continue
+            did = int(deck['id'])
+            if did not in target_ids:
+                target_ids.add(did)
+                targets.append((did, str(deck['name'])))
+
+        all_dids = set()
+        for did, _name in targets:
+            for child_id in collection.decks.deck_and_child_ids(did):
+                all_dids.add(int(child_id))
+
+        # `odid` also catches cards of these decks that sit in a filtered deck
+        # outside ownerDeck (e.g. a top-level "Custom Study Session"). Keep the
+        # `odid != 0`: it lets SQLite use the partial idx_cards_odid index
+        # instead of scanning every card in the shared collection.
+        nids = []
+        if all_dids:
+            ids = ','.join(str(did) for did in all_dids)  # ints only
+            nids = collection.db.list(
+                f"SELECT DISTINCT nid FROM cards "
+                f"WHERE did IN ({ids}) OR (odid != 0 AND odid IN ({ids}))"
+            )
+        if nids:
+            collection.remove_notes(nids)
+
+        # Pick the decks to remove. A kept target stays; only its top-most
+        # non-kept subdecks go (deeper ones go with them). A target that isn't
+        # kept goes with its whole subtree.
+        keep_lower = {name.lower() for name in keepDeckNames}
+        candidates = []
+        for did, name in targets:
+            if name.lower() not in keep_lower:
+                candidates.append((name, did))
+                continue
+            for child_name, child_id in collection.decks.children(did):
+                child_lower = child_name.lower()
+                if child_lower in keep_lower:
+                    continue
+                if child_name.rsplit('::', 1)[0].lower() in keep_lower:
+                    candidates.append((child_name, int(child_id)))
+
+        # Shallowest first, so a deck whose ancestor is already being removed
+        # is skipped (targets 'X::Foo' and 'X::Foo::Bar' remove only 'X::Foo').
+        candidates.sort(key=lambda candidate: candidate[0].count('::'))
+        remove_ids = []
+        root_lower = set()
+        for name, did in candidates:
+            name_lower = name.lower()
+            if name_lower in root_lower:
+                continue
+            parts = name_lower.split('::')
+            ancestor_removed = False
+            for depth in range(1, len(parts)):
+                if '::'.join(parts[:depth]) in root_lower:
+                    ancestor_removed = True
+                    break
+            if ancestor_removed:
+                continue
+            root_lower.add(name_lower)
+            remove_ids.append(did)
+            # Names must be read now: they are gone after remove().
+            subtree_names = [name] + [child_name for child_name, _id in collection.decks.children(did)]
+            for subtree_name in subtree_names:
+                if subtree_name.lower() not in removed_lower:
+                    removed_lower.add(subtree_name.lower())
+                    decks_removed.append(subtree_name)
+
+        if remove_ids:
+            collection.decks.remove([DeckId(did) for did in remove_ids])
+
+        self.refreshGuiIfEnabled()
+
+        return {
+            'notesDeleted': len(nids),
+            'deletedNoteIds': [int(nid) for nid in nids],
+            'decksRemoved': decks_removed,
+            'missing': missing,
+        }
 
     def renameDeck(self, oldName, newName):
         """
@@ -368,7 +548,7 @@ class NoteManager:
 
         if deckName:
             # Verify deck exists
-            deck = collection.decks.byName(deckName)
+            deck = collection.decks.by_name(deckName)
             if deck is None:
                 raise Exception(f"Deck '{deckName}' does not exist")
             # deck:"name" automatically includes all subdecks in Anki
@@ -430,7 +610,7 @@ class NoteManager:
             raise Exception("deckName is required")
 
         # Verify deck exists
-        parent_deck = collection.decks.byName(deckName)
+        parent_deck = collection.decks.by_name(deckName)
         if parent_deck is None:
             raise Exception(f"Deck '{deckName}' does not exist")
 
@@ -439,7 +619,7 @@ class NoteManager:
             note = collection.get_note(noteId)
         except Exception:
             try:
-                note = collection.getNote(noteId)
+                note = collection.get_note(noteId)
             except Exception:
                 raise Exception(f"Note with ID '{noteId}' does not exist")
 
@@ -471,7 +651,7 @@ class NoteManager:
             # Older Anki: legacy remNotes needs the UI-reset wrapper.
             self.startEditing()
             try:
-                collection.remNotes([noteId])
+                collection.remove_notes([noteId])
             finally:
                 self.stopEditing()
         return True
@@ -531,7 +711,7 @@ class NoteManager:
         if collection is None:
             return None
 
-        deck = collection.decks.byName(deckName)
+        deck = collection.decks.by_name(deckName)
         if deck is None:
             return None
 
@@ -627,7 +807,7 @@ class NoteManager:
             }
 
             try:
-                config = collection.decks.confForDid(deck_id)
+                config = collection.decks.config_dict_for_deck_id(deck_id)
                 if config is not None:
                     info['newCardsPerDay'] = config.get('new', {}).get('perDay', 0)
                     info['reviewsPerDay'] = config.get('rev', {}).get('perDay', 0)

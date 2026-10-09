@@ -171,6 +171,46 @@ Deletes a deck and optionally its cards.
 }
 ```
 
+#### resetDecks
+
+Resets all, one or several of a student's decks under their top-level deck. Every note with a card in a target deck (or its subdecks) is deleted. Targets listed in `keepDeckNames` survive empty, keeping their deck id and options, and their non-kept subdecks are removed. Other targets are removed with their subdecks. Every filtered (custom study) deck under `ownerDeck` is removed first, which sends its cards back to their home decks.
+
+**Parameters:**
+
+- `ownerDeck` (string): The student's top-level deck (no `::`)
+- `deckNames` (array): Decks to reset: `ownerDeck` itself and/or its subdecks
+- `keepDeckNames` (array, optional): Decks to empty but keep. Keep the whole path down to a kept deck (e.g. the root as well as `root::Text`), or it is removed with its parent
+
+Names are case-insensitive. A name outside `ownerDeck` fails with `"Deck '<name>' does not belong to deck '<ownerDeck>'"`. A missing `ownerDeck` doesn't raise: every entry of `deckNames` comes back in `missing`. Safe to retry.
+
+**Example (reset everything, keeping Text and Audio):**
+
+```json
+{
+  "action": "resetDecks",
+  "version": 5,
+  "params": {
+    "ownerDeck": "staging_1d04",
+    "deckNames": ["staging_1d04"],
+    "keepDeckNames": ["staging_1d04", "staging_1d04::Text", "staging_1d04::Audio"]
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "result": {
+    "notesDeleted": 42,
+    "deletedNoteIds": [1700000000001, 1700000000002],
+    "decksRemoved": ["staging_1d04::StudyAllForgotten", "staging_1d04::French 10K"],
+    "missing": []
+  },
+  "error": null
+}
+```
+
 #### renameDeck
 
 Renames an existing deck.
