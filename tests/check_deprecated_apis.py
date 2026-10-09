@@ -34,9 +34,11 @@ LIVE_ACTIONS = {
     'updateNoteFields', 'version',
 }
 
-# Live but not endpoints: module-level helpers reached from a live handler.
-# All three are called by setDeckStudyOptions (managers/study_manager.py).
+# Live but not endpoints: helpers reached from a live handler.
 LIVE_HELPERS = {
+    # createNote builds the note for addNote (every flashcard approval).
+    'AnkiConnect.py': {'createNote'},
+    # All three are called by setDeckStudyOptions (managers/study_manager.py).
     'utils/deck_helpers.py': {
         'get_direct_child_decks', 'get_deck_limits', 'update_parent_deck_silent',
     },

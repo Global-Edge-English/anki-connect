@@ -319,11 +319,11 @@ class AnkiBridge:
         if collection is None:
             return
 
-        model = collection.models.byName(params.modelName)
+        model = collection.models.by_name(params.modelName)
         if model is None:
             return
 
-        deck = collection.decks.byName(params.deckName)
+        deck = collection.decks.by_name(params.deckName)
         if deck is None:
             return
 
