@@ -119,6 +119,16 @@ refcounted cleanup is fine; **cycles are the trap**, and the leak rate is
 **Flag in code review:** any nested `def` that recurses, any `{id: node}`
 dict or list holding backend objects, any closure capturing a large structure.
 
+### Deck-list re-renders leak in Anki 26.09's web view
+
+Each full deck-list render (every student's decks in one page) leaks
+~10–15 MB in Anki 26.09's QtWebEngine renderer, so the add-on stops Anki's
+10-minute refresh timer at startup (`_stopDeckListRefreshTimer`). Keep the
+"Refresh GUI after API writes" toggle off on the server (it calls `mw.reset()`
+on every write), and don't add anything that re-renders the deck list on a
+schedule. After an Anki upgrade, check `journalctl -u anki.service` for
+`expected 1 deck-list refresh timer` — it means the timer moved and the leak is back.
+
 ### Modern Anki APIs to prefer (2.1.50+)
 
 - `collection.add_note(note, deck_id)` — runs in a Rust transaction, fires

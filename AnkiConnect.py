@@ -68,7 +68,7 @@ except ImportError:
 #
 
 API_VERSION = 5
-ADDON_VERSION = "0.1.18"  # This will be auto-updated by build_zip.sh
+ADDON_VERSION = "0.1.19"  # This will be auto-updated by build_zip.sh
 TICK_INTERVAL = int(os.getenv('ANKICONNECT_TICK_INTERVAL_MS', '5'))
 
 # Persisted-config key for the Tools-menu "refresh GUI after API writes" toggle.
@@ -1438,6 +1438,7 @@ class AnkiConnect:
         # "refresh GUI after API writes" flag onto the bridge (default off).
         self._config = ConfigManager()
         self._setupSettingsMenu()
+        self._stopDeckListRefreshTimer()
 
 
     def _setupSettingsMenu(self):
@@ -1471,6 +1472,32 @@ class AnkiConnect:
         enabled = bool(checked)
         self.anki.guiRefreshAfterApiWrites = enabled
         self._config.set(CONFIG_GUI_REFRESH, enabled)
+
+
+    def _stopDeckListRefreshTimer(self):
+        """Stop Anki's 10-minute deck-list auto-refresh (aqt main.py
+        setup_timers -> onRefreshTimer). Each tick re-renders the whole deck
+        list - every student's decks in one page - and Anki 26.09's QtWebEngine
+        doesn't free the old page: the web view grew ~10-15 MB per tick until
+        the 600M cgroup cap OOM-killed it every ~5 h. Nobody watches the server
+        GUI; click Decks to refresh it by hand. Anki creates its timers in
+        setupUI() before add-ons load, so the timer exists by now, and it's the
+        main window's only repeating 10-minute QTimer."""
+        try:
+            import aqt
+            from aqt.qt import QTimer
+
+            timers = [
+                t for t in aqt.mw.findChildren(QTimer)
+                if t.interval() == 10 * 60 * 1000 and not t.isSingleShot()
+            ]
+            for t in timers:
+                t.stop()
+            if len(timers) != 1:
+                # Anki changed its timers; the leak returns until this matches again.
+                print('Global Edge AnkiConnect: expected 1 deck-list refresh timer, stopped {}'.format(len(timers)))
+        except Exception:
+            pass  # never let this break server startup
 
 
     def advance(self):
